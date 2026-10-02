@@ -1,5 +1,6 @@
 import io
 import math
+import re
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -43,6 +44,23 @@ def safe_float(val):
         return 0.0 if math.isnan(v) else v
     except (ValueError, TypeError):
         return 0.0
+
+
+def clean_entity_key(nombre):
+    """
+    Sanitiza y normaliza el nombre de la Razón Social / Entidad para que coincidan
+    variaciones como "PRISMA MEDIOS DE PAGO S.A.U" y "PRISMA MEDIOS DE PAGO".
+    """
+    if not nombre or pd.isna(nombre):
+        return ""
+    s = str(nombre).upper()
+    # Eliminar caracteres especiales no alfanuméricos
+    s = re.sub(r'[^A-Z0-9]', ' ', s)
+    words = s.split()
+    # Descartar sufijos sociales y ruido habitual
+    noise_words = {"SA", "SAU", "SRL", "SACIF", "LIMITADA", "LTD", "INC", "CORP", "SOCIEDAD", "ANONIMA"}
+    filtered = [w for w in words if w not in noise_words]
+    return " ".join(filtered) if filtered else " ".join(words)
 
 
 def obtener_monto_mayor(row):
@@ -109,7 +127,7 @@ def procesar_archivos(file_m, file_a):
             monto_m = row_m["MONTO_CALC"]
 
             # Cruce exacto contemplando el signo de ambas partidas
-            if abs(monto_a - monto_m) < 0.50:
+            if abs(monto_a - monto_m) < 0.01:
                 arca_matched_indices.add(idx_a)
                 mayor_matched_indices.add(idx_m)
                 conciliadas_1a1.append({
@@ -126,10 +144,60 @@ def procesar_archivos(file_m, file_a):
                 })
                 break
 
-    unmatched_arca = df_arca[~df_arca.index.isin(arca_matched_indices)]
-    unmatched_mayor = df_mayor[~df_mayor.index.isin(mayor_matched_indices)]
+    unmatched_arca = df_arca[~df_arca.index.isin(arca_matched_indices)].copy()
+    unmatched_mayor = df_mayor[~df_mayor.index.isin(mayor_matched_indices)].copy()
 
-    for idx_a, row_a in unmatched_arca.iterrows():
+    # Asignamos claves sanitizadas para agrupación por entidad
+    unmatched_arca["ENTITY_KEY"] = unmatched_arca["Denominación o Razón Social"].apply(clean_entity_key)
+    unmatched_mayor["ENTITY_KEY"] = unmatched_mayor["ENTIDAD"].apply(clean_entity_key)
+
+    # Obtenemos las entidades comunes entre ambas fuentes no conciliadas 1a1
+    common_entities = set(unmatched_arca["ENTITY_KEY"]).intersection(set(unmatched_mayor["ENTITY_KEY"])) - {""}
+
+    for ent_key in common_entities:
+        group_arca = unmatched_arca[unmatched_arca["ENTITY_KEY"] == ent_key]
+        group_mayor = unmatched_mayor[unmatched_mayor["ENTITY_KEY"] == ent_key]
+
+        sum_arca = round(group_arca["MONTO_CALC"].sum(), 2)
+        sum_mayor = round(group_mayor["MONTO_CALC"].sum(), 2)
+
+        # Si el monto acumulado del lote ARCA coincide con el del lote Mayor
+        if abs(sum_arca - sum_mayor) < 0.50 and sum_arca != 0:
+            # Marcamos los índices como conciliados por lote
+            for idx in group_arca.index:
+                arca_matched_indices.add(idx)
+            for idx in group_mayor.index:
+                mayor_matched_indices.add(idx)
+
+            certs_list = sorted(list(set(group_arca["CERT_STR"].astype(str))))
+            certs_str = ", ".join(certs_list)
+
+            asientos_list = sorted(list(set(group_mayor["ASIENTO_STR"].astype(str))))
+            asientos_str = ", ".join(asientos_list)
+
+            fechas_a = sorted([str(f)[:10] for f in group_arca["Fecha Ret./Perc."].dropna()])
+            fecha_a_str = f"{fechas_a[0]} a {fechas_a[-1]}" if len(fechas_a) > 1 else (fechas_a[0] if fechas_a else "")
+
+            fechas_m = sorted([str(f)[:10] for f in group_mayor["FECHA"].dropna()])
+            fecha_m_str = f"{fechas_m[0]} a {fechas_m[-1]}" if len(fechas_m) > 1 else (fechas_m[0] if fechas_m else "")
+
+            nombre_entidad = group_arca.iloc[0].get("Denominación o Razón Social") or group_mayor.iloc[0].get("ENTIDAD")
+
+            conciliadas_lote.append({
+                "empresa": nombre_entidad,
+                "certs_arca": certs_str,
+                "fecha_arca": fecha_a_str,
+                "monto_arca": sum_arca,
+                "asientos_mayor": asientos_str,
+                "fecha_mayor": fecha_m_str,
+                "monto_mayor": sum_mayor,
+                "obs": f"Conciliación por lote ({len(group_arca)} reg. ARCA vs {len(group_mayor)} reg. Mayor)",
+            })
+
+    final_unmatched_arca = df_arca[~df_arca.index.isin(arca_matched_indices)]
+    final_unmatched_mayor = df_mayor[~df_mayor.index.isin(mayor_matched_indices)]
+
+    for idx_a, row_a in final_unmatched_arca.iterrows():
         pendientes_arca.append({
             "cert_arca": row_a["CERT_STR"],
             "fecha_arca": str(row_a.get("Fecha Ret./Perc.", ""))[:10],
@@ -139,7 +207,7 @@ def procesar_archivos(file_m, file_a):
             "monto_arca": row_a["MONTO_CALC"],
         })
 
-    for idx_m, row_m in unmatched_mayor.iterrows():
+    for idx_m, row_m in final_unmatched_mayor.iterrows():
         pendientes_mayor.append({
             "asiento_mayor": row_m["ASIENTO_STR"],
             "fecha_mayor": str(row_m.get("FECHA", ""))[:10],
@@ -149,7 +217,6 @@ def procesar_archivos(file_m, file_a):
             "monto_mayor": row_m["MONTO_CALC"],
         })
 
-    # Crear Excel
     wb = openpyxl.Workbook()
     ws_resumen = wb.active
     ws_resumen.title = "Resumen General"
@@ -198,7 +265,6 @@ def procesar_archivos(file_m, file_a):
     align_right = Alignment(horizontal="right", vertical="center")
     fmt_currency = '"$ "#,##0.00;("$ "#,##0.00);"-"'
 
-    # 1a1
     ws_1a1.cell(
         row=1, column=1, value="PARTIDAS CONCILIADAS EXACTAS (1 A 1)"
     ).font = font_title
@@ -221,33 +287,17 @@ def procesar_archivos(file_m, file_a):
 
     r_idx = 4
     for item in conciliadas_1a1:
-        ws_1a1.cell(row=r_idx, column=1, value=item["cert_arca"]).alignment = (
-            align_center
-        )
-        ws_1a1.cell(row=r_idx, column=2, value=item["fecha_arca"]).alignment = (
-            align_center
-        )
-        ws_1a1.cell(row=r_idx, column=3, value=item["comp_arca"]).alignment = (
-            align_center
-        )
-        ws_1a1.cell(row=r_idx, column=4, value=item["razon_arca"]).alignment = (
-            align_left
-        )
+        ws_1a1.cell(row=r_idx, column=1, value=item["cert_arca"]).alignment = align_center
+        ws_1a1.cell(row=r_idx, column=2, value=item["fecha_arca"]).alignment = align_center
+        ws_1a1.cell(row=r_idx, column=3, value=item["comp_arca"]).alignment = align_center
+        ws_1a1.cell(row=r_idx, column=4, value=item["razon_arca"]).alignment = align_left
         c_m1 = ws_1a1.cell(row=r_idx, column=5, value=item["monto_arca"])
         c_m1.number_format, c_m1.alignment = fmt_currency, align_right
 
-        ws_1a1.cell(row=r_idx, column=6, value=item["asiento_mayor"]).alignment = (
-            align_center
-        )
-        ws_1a1.cell(row=r_idx, column=7, value=item["fecha_mayor"]).alignment = (
-            align_center
-        )
-        ws_1a1.cell(row=r_idx, column=8, value=item["comp_mayor"]).alignment = (
-            align_center
-        )
-        ws_1a1.cell(row=r_idx, column=9, value=item["razon_mayor"]).alignment = (
-            align_left
-        )
+        ws_1a1.cell(row=r_idx, column=6, value=item["asiento_mayor"]).alignment = align_center
+        ws_1a1.cell(row=r_idx, column=7, value=item["fecha_mayor"]).alignment = align_center
+        ws_1a1.cell(row=r_idx, column=8, value=item["comp_mayor"]).alignment = align_center
+        ws_1a1.cell(row=r_idx, column=9, value=item["razon_mayor"]).alignment = align_left
         c_m2 = ws_1a1.cell(row=r_idx, column=10, value=item["monto_mayor"])
         c_m2.number_format, c_m2.alignment = fmt_currency, align_right
 
@@ -259,9 +309,7 @@ def procesar_archivos(file_m, file_a):
             ws_1a1.cell(row=r_idx, column=c).border = thin_border
         r_idx += 1
 
-    ws_1a1.cell(row=r_idx, column=1, value="TOTAL CONCILIADO 1 A 1").font = (
-        font_bold
-    )
+    ws_1a1.cell(row=r_idx, column=1, value="TOTAL CONCILIADO 1 A 1").font = font_bold
     ws_1a1.cell(row=r_idx, column=1).alignment = align_left
     c_tot1 = ws_1a1.cell(row=r_idx, column=5, value=f"=SUM(E4:E{r_idx-1})")
     c_tot1.font, c_tot1.number_format = font_bold, fmt_currency
@@ -277,7 +325,6 @@ def procesar_archivos(file_m, file_a):
     row_1a1_total = r_idx
     cnt_1a1 = len(conciliadas_1a1)
 
-    # Lote
     ws_lote.cell(
         row=1, column=1, value="PARTIDAS CONCILIADAS POR LOTE (AGRUPADAS)"
     ).font = font_title
@@ -297,21 +344,46 @@ def procesar_archivos(file_m, file_a):
         c.font, c.fill, c.alignment = font_header, fill_lote_hdr, align_center
 
     r_lote_idx = 5
+    for item in conciliadas_lote:
+        ws_lote.cell(row=r_lote_idx, column=1, value=item["empresa"]).alignment = align_left
+        ws_lote.cell(row=r_lote_idx, column=2, value=item["certs_arca"]).alignment = align_center
+        ws_lote.cell(row=r_lote_idx, column=3, value=item["fecha_arca"]).alignment = align_center
+        
+        c_m1 = ws_lote.cell(row=r_lote_idx, column=4, value=item["monto_arca"])
+        c_m1.number_format, c_m1.alignment = fmt_currency, align_right
+
+        ws_lote.cell(row=r_lote_idx, column=5, value=item["asientos_mayor"]).alignment = align_center
+        ws_lote.cell(row=r_lote_idx, column=6, value=item["fecha_mayor"]).alignment = align_center
+
+        c_m2 = ws_lote.cell(row=r_lote_idx, column=7, value=item["monto_mayor"])
+        c_m2.number_format, c_m2.alignment = fmt_currency, align_right
+
+        c_diff = ws_lote.cell(row=r_lote_idx, column=8, value=f"=D{r_lote_idx}-G{r_lote_idx}")
+        c_diff.number_format, c_diff.alignment = fmt_currency, align_right
+
+        ws_lote.cell(row=r_lote_idx, column=9, value=item["obs"]).alignment = align_left
+
+        for c in range(1, 10):
+            ws_lote.cell(row=r_lote_idx, column=c).font = font_regular
+            ws_lote.cell(row=r_lote_idx, column=c).border = thin_border
+        r_lote_idx += 1
+
     ws_lote.cell(
         row=r_lote_idx, column=1, value="TOTAL CONCILIADO POR LOTE"
     ).font = font_bold
-    c_lt1 = ws_lote.cell(
-        row=r_lote_idx, column=4, value=f"=SUM(D5:D{r_lote_idx-1})"
-    )
-    c_lt1.font, c_lt1.number_format = font_bold, fmt_currency
-    c_lt2 = ws_lote.cell(
-        row=r_lote_idx, column=7, value=f"=SUM(G5:G{r_lote_idx-1})"
-    )
-    c_lt2.font, c_lt2.number_format = font_bold, fmt_currency
-    c_ltdiff = ws_lote.cell(
-        row=r_lote_idx, column=8, value=f"=SUM(H5:H{r_lote_idx-1})"
-    )
-    c_ltdiff.font, c_ltdiff.number_format = font_bold, fmt_currency
+
+    if r_lote_idx > 5:
+        c_lt1 = ws_lote.cell(row=r_lote_idx, column=4, value=f"=SUM(D5:D{r_lote_idx-1})")
+        c_lt2 = ws_lote.cell(row=r_lote_idx, column=7, value=f"=SUM(G5:G{r_lote_idx-1})")
+        c_ltdiff = ws_lote.cell(row=r_lote_idx, column=8, value=f"=SUM(H5:H{r_lote_idx-1})")
+    else:
+        c_lt1 = ws_lote.cell(row=r_lote_idx, column=4, value=0)
+        c_lt2 = ws_lote.cell(row=r_lote_idx, column=7, value=0)
+        c_ltdiff = ws_lote.cell(row=r_lote_idx, column=8, value=0)
+
+    c_lt1.font, c_lt1.number_format, c_lt1.alignment = font_bold, fmt_currency, align_right
+    c_lt2.font, c_lt2.number_format, c_lt2.alignment = font_bold, fmt_currency, align_right
+    c_ltdiff.font, c_ltdiff.number_format, c_ltdiff.alignment = font_bold, fmt_currency, align_right
 
     for c in range(1, 10):
         ws_lote.cell(row=r_lote_idx, column=c).fill = fill_total
@@ -320,7 +392,6 @@ def procesar_archivos(file_m, file_a):
     row_lote_total = r_lote_idx
     cnt_lote = len(conciliadas_lote)
 
-    # ARCA
     ws_arca.cell(
         row=1,
         column=1,
@@ -340,21 +411,11 @@ def procesar_archivos(file_m, file_a):
 
     r_arca_idx = 4
     for item in pendientes_arca:
-        ws_arca.cell(
-            row=r_arca_idx, column=1, value=item["cert_arca"]
-        ).alignment = align_center
-        ws_arca.cell(
-            row=r_arca_idx, column=2, value=item["fecha_arca"]
-        ).alignment = align_center
-        ws_arca.cell(
-            row=r_arca_idx, column=3, value=item["tipo_comp"]
-        ).alignment = align_center
-        ws_arca.cell(
-            row=r_arca_idx, column=4, value=item["comp_arca"]
-        ).alignment = align_center
-        ws_arca.cell(
-            row=r_arca_idx, column=5, value=item["razon_arca"]
-        ).alignment = align_left
+        ws_arca.cell(row=r_arca_idx, column=1, value=item["cert_arca"]).alignment = align_center
+        ws_arca.cell(row=r_arca_idx, column=2, value=item["fecha_arca"]).alignment = align_center
+        ws_arca.cell(row=r_arca_idx, column=3, value=item["tipo_comp"]).alignment = align_center
+        ws_arca.cell(row=r_arca_idx, column=4, value=item["comp_arca"]).alignment = align_center
+        ws_arca.cell(row=r_arca_idx, column=5, value=item["razon_arca"]).alignment = align_left
         c_m = ws_arca.cell(row=r_arca_idx, column=6, value=item["monto_arca"])
         c_m.number_format, c_m.alignment = fmt_currency, align_right
 
@@ -363,17 +424,9 @@ def procesar_archivos(file_m, file_a):
             ws_arca.cell(row=r_arca_idx, column=c).border = thin_border
         r_arca_idx += 1
 
-    ws_arca.cell(row=r_arca_idx, column=1, value="TOTAL PENDIENTE ARCA").font = (
-        font_bold
-    )
-    c_totarca = ws_arca.cell(
-        row=r_arca_idx, column=6, value=f"=SUM(F4:F{r_arca_idx-1})"
-    )
-    c_totarca.font, c_totarca.number_format, c_totarca.alignment = (
-        font_bold,
-        fmt_currency,
-        align_right,
-    )
+    ws_arca.cell(row=r_arca_idx, column=1, value="TOTAL PENDIENTE ARCA").font = font_bold
+    c_totarca = ws_arca.cell(row=r_arca_idx, column=6, value=f"=SUM(F4:F{r_arca_idx-1})")
+    c_totarca.font, c_totarca.number_format, c_totarca.alignment = font_bold, fmt_currency, align_right
 
     for c in range(1, 7):
         ws_arca.cell(row=r_arca_idx, column=c).fill = fill_total
@@ -382,7 +435,6 @@ def procesar_archivos(file_m, file_a):
     row_arca_total = r_arca_idx
     cnt_arca = len(pendientes_arca)
 
-    # MAYOR
     ws_mayor.cell(
         row=1,
         column=1,
@@ -402,21 +454,11 @@ def procesar_archivos(file_m, file_a):
 
     r_mayor_idx = 4
     for item in pendientes_mayor:
-        ws_mayor.cell(
-            row=r_mayor_idx, column=1, value=item["asiento_mayor"]
-        ).alignment = align_center
-        ws_mayor.cell(
-            row=r_mayor_idx, column=2, value=item["fecha_mayor"]
-        ).alignment = align_center
-        ws_mayor.cell(
-            row=r_mayor_idx, column=3, value=item["detalle_mayor"]
-        ).alignment = align_left
-        ws_mayor.cell(
-            row=r_mayor_idx, column=4, value=item["ref_mayor"]
-        ).alignment = align_center
-        ws_mayor.cell(
-            row=r_mayor_idx, column=5, value=item["razon_mayor"]
-        ).alignment = align_left
+        ws_mayor.cell(row=r_mayor_idx, column=1, value=item["asiento_mayor"]).alignment = align_center
+        ws_mayor.cell(row=r_mayor_idx, column=2, value=item["fecha_mayor"]).alignment = align_center
+        ws_mayor.cell(row=r_mayor_idx, column=3, value=item["detalle_mayor"]).alignment = align_left
+        ws_mayor.cell(row=r_mayor_idx, column=4, value=item["ref_mayor"]).alignment = align_center
+        ws_mayor.cell(row=r_mayor_idx, column=5, value=item["razon_mayor"]).alignment = align_left
         c_m = ws_mayor.cell(row=r_mayor_idx, column=6, value=item["monto_mayor"])
         c_m.number_format, c_m.alignment = fmt_currency, align_right
 
@@ -425,17 +467,9 @@ def procesar_archivos(file_m, file_a):
             ws_mayor.cell(row=r_mayor_idx, column=c).border = thin_border
         r_mayor_idx += 1
 
-    ws_mayor.cell(
-        row=r_mayor_idx, column=1, value="TOTAL PENDIENTE MAYOR"
-    ).font = font_bold
-    c_totmayor = ws_mayor.cell(
-        row=r_mayor_idx, column=6, value=f"=SUM(F4:F{r_mayor_idx-1})"
-    )
-    c_totmayor.font, c_totmayor.number_format, c_totmayor.alignment = (
-        font_bold,
-        fmt_currency,
-        align_right,
-    )
+    ws_mayor.cell(row=r_mayor_idx, column=1, value="TOTAL PENDIENTE MAYOR").font = font_bold
+    c_totmayor = ws_mayor.cell(row=r_mayor_idx, column=6, value=f"=SUM(F4:F{r_mayor_idx-1})")
+    c_totmayor.font, c_totmayor.number_format, c_totmayor.alignment = font_bold, fmt_currency, align_right
 
     for c in range(1, 7):
         ws_mayor.cell(row=r_mayor_idx, column=c).fill = fill_total
@@ -444,7 +478,6 @@ def procesar_archivos(file_m, file_a):
     row_mayor_total = r_mayor_idx
     cnt_mayor = len(pendientes_mayor)
 
-    # Resumen
     ws_resumen.cell(
         row=1,
         column=1,
@@ -515,25 +548,13 @@ def procesar_archivos(file_m, file_a):
     ws_resumen.cell(row=9, column=2).alignment = align_center
 
     c_tot_arca = ws_resumen.cell(row=9, column=3, value="=SUM(C5:C8)")
-    c_tot_arca.font, c_tot_arca.number_format, c_tot_arca.alignment = (
-        font_bold,
-        fmt_currency,
-        align_right,
-    )
+    c_tot_arca.font, c_tot_arca.number_format, c_tot_arca.alignment = font_bold, fmt_currency, align_right
 
     c_tot_myr = ws_resumen.cell(row=9, column=4, value="=SUM(D5:D8)")
-    c_tot_myr.font, c_tot_myr.number_format, c_tot_myr.alignment = (
-        font_bold,
-        fmt_currency,
-        align_right,
-    )
+    c_tot_myr.font, c_tot_myr.number_format, c_tot_myr.alignment = font_bold, fmt_currency, align_right
 
     c_tot_diff = ws_resumen.cell(row=9, column=5, value="=C9-D9")
-    c_tot_diff.font, c_tot_diff.number_format, c_tot_diff.alignment = (
-        font_bold,
-        fmt_currency,
-        align_right,
-    )
+    c_tot_diff.font, c_tot_diff.number_format, c_tot_diff.alignment = font_bold, fmt_currency, align_right
 
     for c in range(1, 6):
         ws_resumen.cell(row=9, column=c).fill = fill_total
