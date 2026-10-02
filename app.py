@@ -570,8 +570,3 @@ if file_mayor and file_arca:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 ```
-
-### Principales cambios implementados:
-1. **Sanitización de valores nulos con `safe_float`:** Filtra los `NaN` de Pandas y asegura que celdas de `DEBE` vacías no bloqueen el cálculo de `HABER` o `SALDO`.
-2. **Precálculo de columna `MONTO_CALC`:** Todos los registros del Mayor y ARCA son normalizados antes del filtrado y cruce de datos.
-3. **Manejo explícito de importes negativos:** Los registros con valor en `HABER` o `SALDO` negativo se incluyen y escriben correctamente en las pestañas correspondientes (`Pendientes_MAYOR`, `Conciliadas 1a1`, etc.).
