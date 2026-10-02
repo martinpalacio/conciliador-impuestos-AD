@@ -32,7 +32,7 @@ def procesar_archivos(file_m, file_a):
   df_mayor = pd.read_excel(file_m).dropna(how="all")
   df_arca = pd.read_excel(file_a).dropna(how="all")
 
-  df_mayor = df_mayor[df_mayor["DEBE"].notna() & (df_mayor["DEBE"] > 0)].copy()
+  df_mayor = df_mayor[df_mayor["SALDO"].notna() & (df_mayor["SALDO"] > 0)].copy()
   df_arca = df_arca[
       df_arca["Importe Ret./Perc."].notna()
       & (df_arca["Importe Ret./Perc."] > 0)
