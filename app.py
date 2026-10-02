@@ -109,7 +109,7 @@ def procesar_archivos(file_m, file_a):
             monto_m = row_m["MONTO_CALC"]
 
             # Cruce exacto contemplando el signo de ambas partidas
-            if abs(monto_a - monto_m) < 0.01:
+            if abs(monto_a - monto_m) < 0.50:
                 arca_matched_indices.add(idx_a)
                 mayor_matched_indices.add(idx_m)
                 conciliadas_1a1.append({
