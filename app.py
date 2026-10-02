@@ -143,7 +143,7 @@ def procesar_archivos(file_m, file_a):
         pendientes_mayor.append({
             "asiento_mayor": row_m["ASIENTO_STR"],
             "fecha_mayor": str(row_m.get("FECHA", ""))[:10],
-            "tipo_comp": "RECIBO / PV",
+            "detalle_mayor": str(row_m.get("DETALLE", "")),
             "ref_mayor": str(row_m.get("REFERENCIA", "")),
             "razon_mayor": row_m.get("ENTIDAD", ""),
             "monto_mayor": row_m["MONTO_CALC"],
@@ -391,7 +391,7 @@ def procesar_archivos(file_m, file_a):
     headers_mayor = [
         "Nro Asiento",
         "Fecha Contable",
-        "Tipo Comprobante",
+        "Detalle",
         "Referencia",
         "Cuenta / Descripción",
         "Monto Registrado ($)",
@@ -409,8 +409,8 @@ def procesar_archivos(file_m, file_a):
             row=r_mayor_idx, column=2, value=item["fecha_mayor"]
         ).alignment = align_center
         ws_mayor.cell(
-            row=r_mayor_idx, column=3, value=item["tipo_comp"]
-        ).alignment = align_center
+            row=r_mayor_idx, column=3, value=item["detalle_mayor"]
+        ).alignment = align_left
         ws_mayor.cell(
             row=r_mayor_idx, column=4, value=item["ref_mayor"]
         ).alignment = align_center
