@@ -1,3 +1,5 @@
+# Required dependencies for this script to run fully:
+# pip install streamlit pandas openpyxl lxml html5lib
 import io
 import math
 import re
@@ -153,24 +155,34 @@ def convertir_a_xlsx(uploaded_file):
             html_content = raw_bytes.decode('latin1', errors='replace')
 
         try:
-            # Usamos read_html. REQUIERE lxml o html5lib instalados.
-            dfs = pd.read_html(io.StringIO(html_content))
+            # Intentar primero con lxml que suele ser el predeterminado
+            try:
+                dfs = pd.read_html(io.StringIO(html_content), flavor='lxml')
+            except ImportError:
+                # Si falla, intentar con bs4/html5lib si está disponible
+                try:
+                    dfs = pd.read_html(io.StringIO(html_content), flavor='html5lib')
+                except ImportError:
+                    # Intento final genérico, a veces pandas lo resuelve
+                    dfs = pd.read_html(io.StringIO(html_content))
+            
             if not dfs:
                 raise ValueError("No se encontraron tablas de datos legibles en el archivo HTML encubierto.")
             df = dfs[0] # Usualmente AFIP pone todo en la primera tabla
         except ImportError:
             raise ImportError(
                 "Falta librería para leer el archivo de AFIP. "
-                "Instala 'lxml' o 'html5lib' ejecutando: pip install lxml html5lib"
+                "Por favor, asegúrate de instalar las dependencias ejecutando:\n"
+                "pip install lxml html5lib"
             )
         except ValueError as ve:
             # Esto atrapa el "No tables found" de pandas
-            raise ValueError(f"El archivo parece ser HTML pero Pandas no encontró tablas. {str(ve)}")
+            raise ValueError(f"El archivo parece ser HTML pero Pandas no encontró tablas legibles. {str(ve)}")
         except Exception as e_html:
             raise ValueError(
                 f"No se pudo leer el archivo '{uploaded_file.name}'.\n"
-                f"Error original Excel: {e_excel}\n"
-                f"Error al intentar leer como HTML: {e_html}"
+                f"Asegúrate de que el archivo no esté corrupto.\n"
+                f"Detalle técnico: {e_html}"
             )
 
     # Crear un BytesIO con el formato moderno .xlsx
@@ -766,7 +778,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     return output, stats
 
 
-st.title("📊 Conciliador Contable de Retenciones (ARCA vs ERP)")
+st.title("📊 Conciliador Contable de Impuestos (ARCA vs ERP)")
 st.markdown(
     "Selecciona el **ERP de origen**, carga los reportes de **Mayor** y **Mis Retenciones (ARCA)**, "
     "y genera el cruce automático con validación por **CUIT y Razón Social**."
