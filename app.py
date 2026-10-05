@@ -116,11 +116,48 @@ def obtener_monto_mayor(row, cols_config):
     
     return 0.0
 
+def convertir_a_xlsx(uploaded_file):
+    """
+    Detecta si el archivo es .xls o un HTML encubierto (muy común en reportes de AFIP/ARCA)
+    y lo convierte a un objeto .xlsx en memoria para procesarlo uniformemente.
+    """
+    filename = uploaded_file.name.lower()
+    if filename.endswith('.xlsx'):
+        return uploaded_file
+    
+    uploaded_file.seek(0)
+    try:
+        # Intento 1: Leer como archivo Excel binario antiguo (.xls)
+        df = pd.read_excel(uploaded_file)
+    except Exception:
+        try:
+            # Intento 2: Archivo HTML guardado con extensión .xls (clásico de AFIP)
+            uploaded_file.seek(0)
+            html_content = uploaded_file.getvalue().decode('latin1', errors='ignore')
+            dfs = pd.read_html(io.StringIO(html_content))
+            if not dfs:
+                raise ValueError("No se encontraron tablas de datos.")
+            df = dfs[0]
+        except Exception as e:
+            raise ValueError(f"El archivo {uploaded_file.name} no se pudo leer. Verifica que sea válido.") from e
+
+    # Crear un BytesIO con el formato moderno .xlsx
+    output = io.BytesIO()
+    df.to_excel(output, index=False, engine='openpyxl')
+    output.seek(0)
+    output.name = filename + "x"
+    return output
+
+
 def procesar_archivos(file_m, file_a, erp_seleccionado):
     config_erp = ERP_CONFIGS.get(erp_seleccionado, ERP_CONFIGS["AutoDealer"])
     
-    df_mayor = pd.read_excel(file_m).dropna(how="all")
-    df_arca = pd.read_excel(file_a).dropna(how="all")
+    # Convertir automáticamente si detecta formato .xls
+    file_m_xlsx = convertir_a_xlsx(file_m)
+    file_a_xlsx = convertir_a_xlsx(file_a)
+    
+    df_mayor = pd.read_excel(file_m_xlsx).dropna(how="all")
+    df_arca = pd.read_excel(file_a_xlsx).dropna(how="all")
 
     # Mapeo dinámico de nombres de columnas de ARCA
     col_cuit_arca = buscar_columna_arca(df_arca, ["CUIT Agente Ret./Perc.", "CUIT Agente", "CUIT"])
@@ -697,7 +734,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     return output, stats
 
 
-st.title("📊 Conciliador Contable de Retenciones (ARCA vs ERP)")
+st.title("📊 Conciliador Contable de Impuestos (ARCA vs ERP)")
 st.markdown(
     "Selecciona el **ERP de origen**, carga los reportes de **Mayor** y **Mis Retenciones (ARCA)**, "
     "y genera el cruce automático con validación por **CUIT y Razón Social**."
@@ -741,51 +778,54 @@ if file_mayor and file_arca:
     
     if st.button("⚙️ Procesar Conciliación", type="primary", use_container_width=True):
         with st.spinner("Procesando retenciones y aplicando cruce por CUIT..."):
-            excel_bytes, stats = procesar_archivos(file_mayor, file_arca, erp_seleccionado)
-            
-            st.success("✅ ¡Conciliación completada con éxito!")
-            
-            # Métricas rápidas en la UI
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Conciliados 1 a 1", stats["cnt_1a1"])
-            m2.metric("Conciliados por Lote", stats["cnt_lote"])
-            m3.metric("Pendientes ARCA", stats["cnt_arca"])
-            m4.metric("Pendientes Mayor", stats["cnt_mayor"])
+            try:
+                excel_bytes, stats = procesar_archivos(file_mayor, file_arca, erp_seleccionado)
+                
+                st.success("✅ ¡Conciliación completada con éxito!")
+                
+                # Métricas rápidas en la UI
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Conciliados 1 a 1", stats["cnt_1a1"])
+                m2.metric("Conciliados por Lote", stats["cnt_lote"])
+                m3.metric("Pendientes ARCA", stats["cnt_arca"])
+                m4.metric("Pendientes Mayor", stats["cnt_mayor"])
 
-            st.download_button(
-                label="📥 Descargar Reporte Conciliado en Excel",
-                data=excel_bytes,
-                file_name=f"Conciliacion_Retenciones_{erp_seleccionado}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+                st.download_button(
+                    label="📥 Descargar Reporte Conciliado en Excel",
+                    data=excel_bytes,
+                    file_name=f"Conciliacion_Retenciones_{erp_seleccionado}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
 
-            # Previsualización interactiva en Streamlit
-            st.markdown("### 🔍 Previsualización de Resultados")
-            tab1, tab2, tab3, tab4 = st.tabs([
-                "Exactas 1a1", "Por Lote / CUIT", "Pendientes ARCA", "Pendientes Mayor"
-            ])
+                # Previsualización interactiva en Streamlit
+                st.markdown("### 🔍 Previsualización de Resultados")
+                tab1, tab2, tab3, tab4 = st.tabs([
+                    "Exactas 1a1", "Por Lote / CUIT", "Pendientes ARCA", "Pendientes Mayor"
+                ])
 
-            with tab1:
-                if stats["conciliadas_1a1"]:
-                    st.dataframe(pd.DataFrame(stats["conciliadas_1a1"]), use_container_width=True)
-                else:
-                    st.info("No se encontraron registros 1 a 1 exactos.")
+                with tab1:
+                    if stats["conciliadas_1a1"]:
+                        st.dataframe(pd.DataFrame(stats["conciliadas_1a1"]), use_container_width=True)
+                    else:
+                        st.info("No se encontraron registros 1 a 1 exactos.")
 
-            with tab2:
-                if stats["conciliadas_lote"]:
-                    st.dataframe(pd.DataFrame(stats["conciliadas_lote"]), use_container_width=True)
-                else:
-                    st.info("No se encontraron registros acumulados por lote.")
+                with tab2:
+                    if stats["conciliadas_lote"]:
+                        st.dataframe(pd.DataFrame(stats["conciliadas_lote"]), use_container_width=True)
+                    else:
+                        st.info("No se encontraron registros acumulados por lote.")
 
-            with tab3:
-                if stats["pendientes_arca"]:
-                    st.dataframe(pd.DataFrame(stats["pendientes_arca"]), use_container_width=True)
-                else:
-                    st.success("🎉 ¡No hay retenciones pendientes en ARCA!")
+                with tab3:
+                    if stats["pendientes_arca"]:
+                        st.dataframe(pd.DataFrame(stats["pendientes_arca"]), use_container_width=True)
+                    else:
+                        st.success("🎉 ¡No hay retenciones pendientes en ARCA!")
 
-            with tab4:
-                if stats["pendientes_mayor"]:
-                    st.dataframe(pd.DataFrame(stats["pendientes_mayor"]), use_container_width=True)
-                else:
-                    st.success("🎉 ¡No hay registros pendientes en el Mayor!")
+                with tab4:
+                    if stats["pendientes_mayor"]:
+                        st.dataframe(pd.DataFrame(stats["pendientes_mayor"]), use_container_width=True)
+                    else:
+                        st.success("🎉 ¡No hay registros pendientes en el Mayor!")
+            except Exception as error:
+                st.error(f"❌ Ocurrió un error al procesar los archivos: {str(error)}")
