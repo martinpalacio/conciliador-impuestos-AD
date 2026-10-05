@@ -120,26 +120,58 @@ def convertir_a_xlsx(uploaded_file):
     """
     Detecta si el archivo es .xls o un HTML encubierto (muy común en reportes de AFIP/ARCA)
     y lo convierte a un objeto .xlsx en memoria para procesarlo uniformemente.
+    Mejorado para soportar múltiples codificaciones y reportar errores de librerías.
     """
     filename = uploaded_file.name.lower()
     if filename.endswith('.xlsx'):
         return uploaded_file
     
     uploaded_file.seek(0)
+    
+    # Intento 1: Leer como archivo Excel binario antiguo (.xls) usando xlrd si estuviera disponible
+    # Pandas por defecto intenta con xlrd para .xls
     try:
-        # Intento 1: Leer como archivo Excel binario antiguo (.xls)
         df = pd.read_excel(uploaded_file)
-    except Exception:
+    except Exception as e_excel:
+        # Intento 2: Archivo HTML guardado con extensión .xls (clásico de AFIP)
+        uploaded_file.seek(0)
+        raw_bytes = uploaded_file.getvalue()
+        
+        # Probamos distintas codificaciones comunes en Argentina
+        encodings = ['utf-8', 'latin1', 'cp1252']
+        html_content = None
+        
+        for enc in encodings:
+            try:
+                html_content = raw_bytes.decode(enc)
+                break # Si decodifica bien, salimos del loop
+            except UnicodeDecodeError:
+                continue
+                
+        if not html_content:
+            # Fallback si ninguna codificación funciona perfecto
+            html_content = raw_bytes.decode('latin1', errors='replace')
+
         try:
-            # Intento 2: Archivo HTML guardado con extensión .xls (clásico de AFIP)
-            uploaded_file.seek(0)
-            html_content = uploaded_file.getvalue().decode('latin1', errors='ignore')
+            # Usamos read_html. REQUIERE lxml o html5lib instalados.
             dfs = pd.read_html(io.StringIO(html_content))
             if not dfs:
-                raise ValueError("No se encontraron tablas de datos.")
-            df = dfs[0]
-        except Exception as e:
-            raise ValueError(f"El archivo {uploaded_file.name} no se pudo leer. Verifica que sea válido.") from e
+                raise ValueError("No se encontraron tablas de datos legibles en el archivo HTML encubierto.")
+            df = dfs[0] # Usualmente AFIP pone todo en la primera tabla
+        except ImportError:
+            raise ImportError(
+                "Falta librería para leer el archivo de AFIP. "
+                "Instala 'lxml' o 'html5lib' ejecutando: pip install lxml html5lib"
+            )
+        except ValueError as ve:
+            # Esto atrapa el "No tables found" de pandas
+            raise ValueError(f"El archivo parece ser HTML pero Pandas no encontró tablas. {str(ve)}")
+        except Exception as e_html:
+            raise ValueError(
+                f"No se pudo leer el archivo '{uploaded_file.name}'.\n"
+                f"Error original Excel: {e_excel}\n"
+                f"Error al intentar leer como HTML: {e_html}"
+            )
 
     # Crear un BytesIO con el formato moderno .xlsx
     output = io.BytesIO()
@@ -734,7 +766,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     return output, stats
 
 
-st.title("📊 Conciliador Contable de Impuestos (ARCA vs ERP)")
+st.title("📊 Conciliador Contable de Retenciones (ARCA vs ERP)")
 st.markdown(
     "Selecciona el **ERP de origen**, carga los reportes de **Mayor** y **Mis Retenciones (ARCA)**, "
     "y genera el cruce automático con validación por **CUIT y Razón Social**."
