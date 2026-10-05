@@ -8,27 +8,36 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="Conciliación Contable", page_icon="📊", layout="wide"
+    page_title="Conciliación Contable Multiorigen",
+    page_icon="📊",
+    layout="wide"
 )
 
-st.title("📊 Conciliación Contable de Retenciones")
-st.markdown(
-    "Sube los archivos **Mayor.xlsx** y **MisRetenciones.xlsx** para generar el"
-    " reporte consolidado."
-)
-
-col1, col2 = st.columns(2)
-
-with col1:
-    file_mayor = st.file_uploader(
-        "Subir Mayor.xlsx", type=["xlsx", "xls"], key="mayor"
-    )
-
-with col2:
-    file_arca = st.file_uploader(
-        "Subir MisRetenciones.xlsx", type=["xlsx", "xls"], key="arca"
-    )
-
+ERP_CONFIGS = {
+    "AutoDealer": {
+        "asiento": "ASIENTO",
+        "fecha": "FECHA",
+        "detalle": "DETALLE",
+        "referencia": "REFERENCIA",
+        "entidad": "ENTIDAD",
+        "cuit": "CUIT",
+        "debe": "DEBE",
+        "haber": "HABER",
+        "saldo": "SALDO",
+    },
+    "Bejerman": {
+        "asiento": "AsientoNumero",
+        "fecha": "Fecha",
+        "detalle": "Concepto",
+        "referencia": "CodigoCliProv",
+        "ref_secundaria": "NroCompFlex",
+        "entidad": "RazonSocial",
+        "cuit": "CliProvNroDocumento",
+        "debe": "ImpDebe_Loc",
+        "haber": "ImpHaber_Loc",
+        "saldo": "ImpTotal_Loc",
+    }
+}
 
 def safe_float(val):
     """
@@ -46,31 +55,57 @@ def safe_float(val):
         return 0.0
 
 
+def clean_cuit(cuit_val):
+    """
+    Limpia y normaliza un CUIT/CUIL dejando solo dígitos numéricos.
+    Mantiene ceros a la izquierda si los hay.
+    """
+    if pd.isna(cuit_val) or cuit_val is None:
+        return ""
+    # Convertir a string sin decimales flotantes .0
+    s_cuit = str(cuit_val).replace(".0", "").strip()
+    digits = re.sub(r'\D', '', s_cuit)
+    return digits if len(digits) >= 8 else s_cuit.strip()
+
+
 def clean_entity_key(nombre):
     """
-    Sanitiza y normaliza el nombre de la Razón Social / Entidad para que coincidan
-    variaciones como "PRISMA MEDIOS DE PAGO S.A.U" y "PRISMA MEDIOS DE PAGO".
+    Sanitiza y normaliza el nombre de la Razón Social / Entidad como criterio secundario.
     """
     if not nombre or pd.isna(nombre):
         return ""
     s = str(nombre).upper()
-    # Eliminar caracteres especiales no alfanuméricos
     s = re.sub(r'[^A-Z0-9]', ' ', s)
     words = s.split()
-    # Descartar sufijos sociales y ruido habitual
     noise_words = {"SA", "SAU", "SRL", "SACIF", "LIMITADA", "LTD", "INC", "CORP", "SOCIEDAD", "ANONIMA"}
     filtered = [w for w in words if w not in noise_words]
     return " ".join(filtered) if filtered else " ".join(words)
 
 
-def obtener_monto_mayor(row):
+def buscar_columna_arca(df_arca, posibles_nombres):
     """
-    Obtiene el monto del registro del Mayor evaluando DEBE, HABER y SALDO.
-    Garantiza que celdas vacías (NaN en DEBE) permitan la lectura de HABER y SALDO.
+    Busca de forma flexible la columna correspondiente en el reporte de ARCA.
     """
-    debe = safe_float(row.get("DEBE"))
-    haber = safe_float(row.get("HABER"))
-    saldo = safe_float(row.get("SALDO"))
+    for col in df_arca.columns:
+        col_clean = str(col).strip().lower()
+        for p in posibles_nombres:
+            if p.lower() in col_clean:
+                return col
+    return posibles_nombres[0] if posibles_nombres else ""
+
+
+def obtener_monto_mayor(row, cols_config):
+    """
+    Obtiene el monto del registro del Mayor evaluando DEBE, HABER y SALDO
+    según la configuración de columnas del ERP activo.
+    """
+    col_debe = cols_config.get("debe", "DEBE")
+    col_haber = cols_config.get("haber", "HABER")
+    col_saldo = cols_config.get("saldo", "SALDO")
+
+    debe = safe_float(row.get(col_debe))
+    haber = safe_float(row.get(col_haber))
+    saldo = safe_float(row.get(col_saldo))
 
     if debe != 0:
         return round(debe, 2)
@@ -81,29 +116,53 @@ def obtener_monto_mayor(row):
     
     return 0.0
 
-
-def procesar_archivos(file_m, file_a):
+def procesar_archivos(file_m, file_a, erp_seleccionado):
+    config_erp = ERP_CONFIGS.get(erp_seleccionado, ERP_CONFIGS["AutoDealer"])
+    
     df_mayor = pd.read_excel(file_m).dropna(how="all")
     df_arca = pd.read_excel(file_a).dropna(how="all")
 
-    # Calculamos montos numéricos limpios resolviendo NaNs
-    df_mayor["MONTO_CALC"] = df_mayor.apply(obtener_monto_mayor, axis=1)
-    df_arca["MONTO_CALC"] = df_arca.apply(
-        lambda r: round(safe_float(r.get("Importe Ret./Perc.")), 2), axis=1
-    )
+    # Mapeo dinámico de nombres de columnas de ARCA
+    col_cuit_arca = buscar_columna_arca(df_arca, ["CUIT Agente Ret./Perc.", "CUIT Agente", "CUIT"])
+    col_cert_arca = buscar_columna_arca(df_arca, ["Número Certificado", "Nro Certificado", "Certificado"])
+    col_fecha_arca = buscar_columna_arca(df_arca, ["Fecha Ret./Perc.", "Fecha Registro", "Fecha"])
+    col_comp_arca = buscar_columna_arca(df_arca, ["Número Comprobante", "Nro Comprobante", "Comprobante"])
+    col_razon_arca = buscar_columna_arca(df_arca, ["Denominación o Razón Social", "Razon Social", "Denominacion"])
+    col_monto_arca = buscar_columna_arca(df_arca, ["Importe Ret./Perc.", "Importe", "Monto"])
+    col_tipo_arca = buscar_columna_arca(df_arca, ["Descripción Comprobante", "Tipo Comprobante"])
 
-    # Filtramos únicamente registros cuyo monto calculado sea distinto de cero (incluye negativos)
+    # Columnas del Mayor según el ERP
+    col_asiento_m = config_erp.get("asiento", "ASIENTO")
+    col_fecha_m = config_erp.get("fecha", "FECHA")
+    col_detalle_m = config_erp.get("detalle", "DETALLE")
+    col_ref_m = config_erp.get("referencia", "REFERENCIA")
+    col_ref_sec_m = config_erp.get("ref_secundaria", "")
+    col_entidad_m = config_erp.get("entidad", "ENTIDAD")
+    col_cuit_m = config_erp.get("cuit", "CUIT")
+
+    # Calculamos montos numéricos limpios
+    df_mayor["MONTO_CALC"] = df_mayor.apply(lambda r: obtener_monto_mayor(r, config_erp), axis=1)
+    df_arca["MONTO_CALC"] = df_arca.apply(lambda r: round(safe_float(r.get(col_monto_arca)), 2), axis=1)
+
+    # Filtrar únicamente registros no nulos en monto
     df_mayor = df_mayor[df_mayor["MONTO_CALC"] != 0].copy()
     df_arca = df_arca[df_arca["MONTO_CALC"] != 0].copy()
 
+    # Normalización de CUIT y claves
+    df_mayor["CUIT_CLEAN"] = df_mayor.get(col_cuit_m, pd.Series(dtype=object)).apply(clean_cuit)
+    df_arca["CUIT_CLEAN"] = df_arca.get(col_cuit_arca, pd.Series(dtype=object)).apply(clean_cuit)
+
+    df_mayor["ENTITY_KEY"] = df_mayor.get(col_entidad_m, pd.Series(dtype=object)).apply(clean_entity_key)
+    df_arca["ENTITY_KEY"] = df_arca.get(col_razon_arca, pd.Series(dtype=object)).apply(clean_entity_key)
+
     df_mayor["ASIENTO_STR"] = (
-        df_mayor.get("ASIENTO", pd.Series(dtype=object))
+        df_mayor.get(col_asiento_m, pd.Series(dtype=object))
         .fillna("")
         .astype(str)
         .str.replace(".0", "", regex=False)
     )
     df_arca["CERT_STR"] = (
-        df_arca.get("Número Certificado", pd.Series(dtype=object))
+        df_arca.get(col_cert_arca, pd.Series(dtype=object))
         .fillna("")
         .astype(str)
         .str.replace(".0", "", regex=False)
@@ -119,27 +178,40 @@ def procesar_archivos(file_m, file_a):
 
     for idx_a, row_a in df_arca.iterrows():
         monto_a = row_a["MONTO_CALC"]
+        cuit_a = row_a["CUIT_CLEAN"]
         
         for idx_m, row_m in df_mayor.iterrows():
             if idx_m in mayor_matched_indices:
                 continue
             
             monto_m = row_m["MONTO_CALC"]
+            cuit_m = row_m["CUIT_CLEAN"]
 
-            # Cruce exacto contemplando el signo de ambas partidas
-            if abs(monto_a - monto_m) < 0.01:
+            # Comprobación de coincidencia por monto (y CUIT si ambos están disponibles)
+            monto_coincide = abs(monto_a - monto_m) < 0.01
+            cuit_coincide = (cuit_a == cuit_m) if (cuit_a and cuit_m) else True
+
+            if monto_coincide and cuit_coincide:
                 arca_matched_indices.add(idx_a)
                 mayor_matched_indices.add(idx_m)
+
+                # Construir detalle del comprobante del mayor
+                detalle_comp = str(row_m.get(col_detalle_m, ""))
+                if col_ref_sec_m and row_m.get(col_ref_sec_m):
+                    detalle_comp += f" [{row_m.get(col_ref_sec_m)}]"
+
                 conciliadas_1a1.append({
                     "cert_arca": row_a["CERT_STR"],
-                    "fecha_arca": str(row_a.get("Fecha Ret./Perc.", ""))[:10],
-                    "comp_arca": str(row_a.get("Número Comprobante", "")),
-                    "razon_arca": row_a.get("Denominación o Razón Social", ""),
+                    "fecha_arca": str(row_a.get(col_fecha_arca, ""))[:10],
+                    "comp_arca": str(row_a.get(col_comp_arca, "")),
+                    "cuit_arca": row_a.get(col_cuit_arca, ""),
+                    "razon_arca": row_a.get(col_razon_arca, ""),
                     "monto_arca": monto_a,
                     "asiento_mayor": row_m["ASIENTO_STR"],
-                    "fecha_mayor": str(row_m.get("FECHA", ""))[:10],
-                    "comp_mayor": str(row_m.get("DETALLE", "")),
-                    "razon_mayor": row_m.get("ENTIDAD", ""),
+                    "fecha_mayor": str(row_m.get(col_fecha_m, ""))[:10],
+                    "comp_mayor": detalle_comp,
+                    "cuit_mayor": row_m.get(col_cuit_m, ""),
+                    "razon_mayor": row_m.get(col_entidad_m, ""),
                     "monto_mayor": monto_m,
                 })
                 break
@@ -147,23 +219,19 @@ def procesar_archivos(file_m, file_a):
     unmatched_arca = df_arca[~df_arca.index.isin(arca_matched_indices)].copy()
     unmatched_mayor = df_mayor[~df_mayor.index.isin(mayor_matched_indices)].copy()
 
-    # Asignamos claves sanitizadas para agrupación por entidad
-    unmatched_arca["ENTITY_KEY"] = unmatched_arca["Denominación o Razón Social"].apply(clean_entity_key)
-    unmatched_mayor["ENTITY_KEY"] = unmatched_mayor["ENTIDAD"].apply(clean_entity_key)
+    # Prioridad 1 para cruce en lote: CUITs comunes que no estén vacíos
+    cuits_arca = set(unmatched_arca["CUIT_CLEAN"]) - {""}
+    cuits_mayor = set(unmatched_mayor["CUIT_CLEAN"]) - {""}
+    common_cuits = cuits_arca.intersection(cuits_mayor)
 
-    # Obtenemos las entidades comunes entre ambas fuentes no conciliadas 1a1
-    common_entities = set(unmatched_arca["ENTITY_KEY"]).intersection(set(unmatched_mayor["ENTITY_KEY"])) - {""}
-
-    for ent_key in common_entities:
-        group_arca = unmatched_arca[unmatched_arca["ENTITY_KEY"] == ent_key]
-        group_mayor = unmatched_mayor[unmatched_mayor["ENTITY_KEY"] == ent_key]
+    for cuit_key in common_cuits:
+        group_arca = unmatched_arca[unmatched_arca["CUIT_CLEAN"] == cuit_key]
+        group_mayor = unmatched_mayor[unmatched_mayor["CUIT_CLEAN"] == cuit_key]
 
         sum_arca = round(group_arca["MONTO_CALC"].sum(), 2)
         sum_mayor = round(group_mayor["MONTO_CALC"].sum(), 2)
 
-        # Si el monto acumulado del lote ARCA coincide con el del lote Mayor
         if abs(sum_arca - sum_mayor) < 0.50 and sum_arca != 0:
-            # Marcamos los índices como conciliados por lote
             for idx in group_arca.index:
                 arca_matched_indices.add(idx)
             for idx in group_mayor.index:
@@ -175,23 +243,71 @@ def procesar_archivos(file_m, file_a):
             asientos_list = sorted(list(set(group_mayor["ASIENTO_STR"].astype(str))))
             asientos_str = ", ".join(asientos_list)
 
-            fechas_a = sorted([str(f)[:10] for f in group_arca["Fecha Ret./Perc."].dropna()])
+            fechas_a = sorted([str(f)[:10] for f in group_arca[col_fecha_arca].dropna()])
             fecha_a_str = f"{fechas_a[0]} a {fechas_a[-1]}" if len(fechas_a) > 1 else (fechas_a[0] if fechas_a else "")
 
-            fechas_m = sorted([str(f)[:10] for f in group_mayor["FECHA"].dropna()])
+            fechas_m = sorted([str(f)[:10] for f in group_mayor[col_fecha_m].dropna()])
             fecha_m_str = f"{fechas_m[0]} a {fechas_m[-1]}" if len(fechas_m) > 1 else (fechas_m[0] if fechas_m else "")
 
-            nombre_entidad = group_arca.iloc[0].get("Denominación o Razón Social") or group_mayor.iloc[0].get("ENTIDAD")
+            nombre_entidad = group_arca.iloc[0].get(col_razon_arca) or group_mayor.iloc[0].get(col_entidad_m)
+            cuit_real = group_arca.iloc[0].get(col_cuit_arca) or group_mayor.iloc[0].get(col_cuit_m) or cuit_key
 
             conciliadas_lote.append({
                 "empresa": nombre_entidad,
+                "cuit": cuit_real,
                 "certs_arca": certs_str,
                 "fecha_arca": fecha_a_str,
                 "monto_arca": sum_arca,
                 "asientos_mayor": asientos_str,
                 "fecha_mayor": fecha_m_str,
                 "monto_mayor": sum_mayor,
-                "obs": f"Conciliación por lote ({len(group_arca)} reg. ARCA vs {len(group_mayor)} reg. Mayor)",
+                "obs": f"Conciliación por CUIT por lote ({len(group_arca)} reg. ARCA vs {len(group_mayor)} reg. Mayor)",
+            })
+
+    # Prioridad 2 para cruce en lote: Razón social sanitizada para los no matcheados por CUIT
+    unmatched_arca_p2 = df_arca[~df_arca.index.isin(arca_matched_indices)].copy()
+    unmatched_mayor_p2 = df_mayor[~df_mayor.index.isin(mayor_matched_indices)].copy()
+
+    common_entities = set(unmatched_arca_p2["ENTITY_KEY"]).intersection(set(unmatched_mayor_p2["ENTITY_KEY"])) - {""}
+
+    for ent_key in common_entities:
+        group_arca = unmatched_arca_p2[unmatched_arca_p2["ENTITY_KEY"] == ent_key]
+        group_mayor = unmatched_mayor_p2[unmatched_mayor_p2["ENTITY_KEY"] == ent_key]
+
+        sum_arca = round(group_arca["MONTO_CALC"].sum(), 2)
+        sum_mayor = round(group_mayor["MONTO_CALC"].sum(), 2)
+
+        if abs(sum_arca - sum_mayor) < 0.50 and sum_arca != 0:
+            for idx in group_arca.index:
+                arca_matched_indices.add(idx)
+            for idx in group_mayor.index:
+                mayor_matched_indices.add(idx)
+
+            certs_list = sorted(list(set(group_arca["CERT_STR"].astype(str))))
+            certs_str = ", ".join(certs_list)
+
+            asientos_list = sorted(list(set(group_mayor["ASIENTO_STR"].astype(str))))
+            asientos_str = ", ".join(asientos_list)
+
+            fechas_a = sorted([str(f)[:10] for f in group_arca[col_fecha_arca].dropna()])
+            fecha_a_str = f"{fechas_a[0]} a {fechas_a[-1]}" if len(fechas_a) > 1 else (fechas_a[0] if fechas_a else "")
+
+            fechas_m = sorted([str(f)[:10] for f in group_mayor[col_fecha_m].dropna()])
+            fecha_m_str = f"{fechas_m[0]} a {fechas_m[-1]}" if len(fechas_m) > 1 else (fechas_m[0] if fechas_m else "")
+
+            nombre_entidad = group_arca.iloc[0].get(col_razon_arca) or group_mayor.iloc[0].get(col_entidad_m)
+            cuit_real = group_arca.iloc[0].get(col_cuit_arca) or group_mayor.iloc[0].get(col_cuit_m) or ""
+
+            conciliadas_lote.append({
+                "empresa": nombre_entidad,
+                "cuit": cuit_real,
+                "certs_arca": certs_str,
+                "fecha_arca": fecha_a_str,
+                "monto_arca": sum_arca,
+                "asientos_mayor": asientos_str,
+                "fecha_mayor": fecha_m_str,
+                "monto_mayor": sum_mayor,
+                "obs": f"Conciliación por Razón Social por lote ({len(group_arca)} reg. ARCA vs {len(group_mayor)} reg. Mayor)",
             })
 
     final_unmatched_arca = df_arca[~df_arca.index.isin(arca_matched_indices)]
@@ -200,20 +316,26 @@ def procesar_archivos(file_m, file_a):
     for idx_a, row_a in final_unmatched_arca.iterrows():
         pendientes_arca.append({
             "cert_arca": row_a["CERT_STR"],
-            "fecha_arca": str(row_a.get("Fecha Ret./Perc.", ""))[:10],
-            "tipo_comp": str(row_a.get("Descripción Comprobante", "")),
-            "comp_arca": str(row_a.get("Número Comprobante", "")),
-            "razon_arca": row_a.get("Denominación o Razón Social", ""),
+            "fecha_arca": str(row_a.get(col_fecha_arca, ""))[:10],
+            "tipo_comp": str(row_a.get(col_tipo_arca, "")),
+            "comp_arca": str(row_a.get(col_comp_arca, "")),
+            "cuit_arca": str(row_a.get(col_cuit_arca, "")),
+            "razon_arca": row_a.get(col_razon_arca, ""),
             "monto_arca": row_a["MONTO_CALC"],
         })
 
     for idx_m, row_m in final_unmatched_mayor.iterrows():
+        ref_val = str(row_m.get(col_ref_m, ""))
+        if col_ref_sec_m and row_m.get(col_ref_sec_m):
+            ref_val += f" / {row_m.get(col_ref_sec_m)}"
+
         pendientes_mayor.append({
             "asiento_mayor": row_m["ASIENTO_STR"],
-            "fecha_mayor": str(row_m.get("FECHA", ""))[:10],
-            "detalle_mayor": str(row_m.get("DETALLE", "")),
-            "ref_mayor": str(row_m.get("REFERENCIA", "")),
-            "razon_mayor": row_m.get("ENTIDAD", ""),
+            "fecha_mayor": str(row_m.get(col_fecha_m, ""))[:10],
+            "detalle_mayor": str(row_m.get(col_detalle_m, "")),
+            "ref_mayor": ref_val,
+            "cuit_mayor": str(row_m.get(col_cuit_m, "")),
+            "razon_mayor": row_m.get(col_entidad_m, ""),
             "monto_mayor": row_m["MONTO_CALC"],
         })
 
@@ -233,29 +355,15 @@ def procesar_archivos(file_m, file_a):
     font_bold = Font(name="Arial", size=10, bold=True)
     font_regular = Font(name="Arial", size=10)
 
-    fill_resumen_hdr = PatternFill(
-        start_color="1F4E79", end_color="1F4E79", fill_type="solid"
-    )
-    fill_1a1_hdr = PatternFill(
-        start_color="2E75B6", end_color="2E75B6", fill_type="solid"
-    )
-    fill_lote_hdr = PatternFill(
-        start_color="2E75B6", end_color="2E75B6", fill_type="solid"
-    )
-    fill_arca_hdr = PatternFill(
-        start_color="C65911", end_color="C65911", fill_type="solid"
-    )
-    fill_mayor_hdr = PatternFill(
-        start_color="595959", end_color="595959", fill_type="solid"
-    )
-    fill_total = PatternFill(
-        start_color="F2F2F2", end_color="F2F2F2", fill_type="solid"
-    )
+    fill_resumen_hdr = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    fill_1a1_hdr = PatternFill(start_color="2E75B6", end_color="2E75B6", fill_type="solid")
+    fill_lote_hdr = PatternFill(start_color="2E75B6", end_color="2E75B6", fill_type="solid")
+    fill_arca_hdr = PatternFill(start_color="C65911", end_color="C65911", fill_type="solid")
+    fill_mayor_hdr = PatternFill(start_color="595959", end_color="595959", fill_type="solid")
+    fill_total = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
 
     thin_side = Side(border_style="thin", color="D9D9D9")
-    thin_border = Border(
-        left=thin_side, right=thin_side, top=thin_side, bottom=thin_side
-    )
+    thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
     double_bottom = Side(border_style="double", color="000000")
     top_thin = Side(border_style="thin", color="000000")
     total_border = Border(top=top_thin, bottom=double_bottom)
@@ -265,18 +373,18 @@ def procesar_archivos(file_m, file_a):
     align_right = Alignment(horizontal="right", vertical="center")
     fmt_currency = '"$ "#,##0.00;("$ "#,##0.00);"-"'
 
-    ws_1a1.cell(
-        row=1, column=1, value="PARTIDAS CONCILIADAS EXACTAS (1 A 1)"
-    ).font = font_title
+    ws_1a1.cell(row=1, column=1, value=f"PARTIDAS CONCILIADAS EXACTAS 1 A 1 ({erp_seleccionado.upper()})").font = font_title
     headers_1a1 = [
         "Certif. ARCA",
         "Fecha ARCA",
-        "Comprobante",
+        "Comprobante ARCA",
+        "CUIT ARCA",
         "Razón Social ARCA",
         "Monto ARCA ($)",
         "Asiento Mayor",
         "Fecha Mayor",
-        "Comprobante Mayor",
+        "Detalle / Comp. Mayor",
+        "CUIT Mayor",
         "Razón Social Mayor",
         "Monto Mayor ($)",
         "Diferencia ($)",
@@ -290,52 +398,55 @@ def procesar_archivos(file_m, file_a):
         ws_1a1.cell(row=r_idx, column=1, value=item["cert_arca"]).alignment = align_center
         ws_1a1.cell(row=r_idx, column=2, value=item["fecha_arca"]).alignment = align_center
         ws_1a1.cell(row=r_idx, column=3, value=item["comp_arca"]).alignment = align_center
-        ws_1a1.cell(row=r_idx, column=4, value=item["razon_arca"]).alignment = align_left
-        c_m1 = ws_1a1.cell(row=r_idx, column=5, value=item["monto_arca"])
+        ws_1a1.cell(row=r_idx, column=4, value=item["cuit_arca"]).alignment = align_center
+        ws_1a1.cell(row=r_idx, column=5, value=item["razon_arca"]).alignment = align_left
+        
+        c_m1 = ws_1a1.cell(row=r_idx, column=6, value=item["monto_arca"])
         c_m1.number_format, c_m1.alignment = fmt_currency, align_right
 
-        ws_1a1.cell(row=r_idx, column=6, value=item["asiento_mayor"]).alignment = align_center
-        ws_1a1.cell(row=r_idx, column=7, value=item["fecha_mayor"]).alignment = align_center
-        ws_1a1.cell(row=r_idx, column=8, value=item["comp_mayor"]).alignment = align_center
-        ws_1a1.cell(row=r_idx, column=9, value=item["razon_mayor"]).alignment = align_left
-        c_m2 = ws_1a1.cell(row=r_idx, column=10, value=item["monto_mayor"])
+        ws_1a1.cell(row=r_idx, column=7, value=item["asiento_mayor"]).alignment = align_center
+        ws_1a1.cell(row=r_idx, column=8, value=item["fecha_mayor"]).alignment = align_center
+        ws_1a1.cell(row=r_idx, column=9, value=item["comp_mayor"]).alignment = align_left
+        ws_1a1.cell(row=r_idx, column=10, value=item["cuit_mayor"]).alignment = align_center
+        ws_1a1.cell(row=r_idx, column=11, value=item["razon_mayor"]).alignment = align_left
+        
+        c_m2 = ws_1a1.cell(row=r_idx, column=12, value=item["monto_mayor"])
         c_m2.number_format, c_m2.alignment = fmt_currency, align_right
 
-        c_diff = ws_1a1.cell(row=r_idx, column=11, value=f"=E{r_idx}-J{r_idx}")
+        c_diff = ws_1a1.cell(row=r_idx, column=13, value=f"=F{r_idx}-L{r_idx}")
         c_diff.number_format, c_diff.alignment = fmt_currency, align_right
 
-        for c in range(1, 12):
+        for c in range(1, 14):
             ws_1a1.cell(row=r_idx, column=c).font = font_regular
             ws_1a1.cell(row=r_idx, column=c).border = thin_border
         r_idx += 1
 
     ws_1a1.cell(row=r_idx, column=1, value="TOTAL CONCILIADO 1 A 1").font = font_bold
     ws_1a1.cell(row=r_idx, column=1).alignment = align_left
-    c_tot1 = ws_1a1.cell(row=r_idx, column=5, value=f"=SUM(E4:E{r_idx-1})")
+    c_tot1 = ws_1a1.cell(row=r_idx, column=6, value=f"=SUM(F4:F{r_idx-1})")
     c_tot1.font, c_tot1.number_format = font_bold, fmt_currency
-    c_tot2 = ws_1a1.cell(row=r_idx, column=10, value=f"=SUM(J4:J{r_idx-1})")
+    c_tot2 = ws_1a1.cell(row=r_idx, column=12, value=f"=SUM(L4:L{r_idx-1})")
     c_tot2.font, c_tot2.number_format = font_bold, fmt_currency
-    c_totdiff = ws_1a1.cell(row=r_idx, column=11, value=f"=SUM(K4:K{r_idx-1})")
+    c_totdiff = ws_1a1.cell(row=r_idx, column=13, value=f"=SUM(M4:M{r_idx-1})")
     c_totdiff.font, c_totdiff.number_format = font_bold, fmt_currency
 
-    for c in range(1, 12):
+    for c in range(1, 14):
         ws_1a1.cell(row=r_idx, column=c).fill = fill_total
         ws_1a1.cell(row=r_idx, column=c).border = total_border
 
     row_1a1_total = r_idx
     cnt_1a1 = len(conciliadas_1a1)
 
-    ws_lote.cell(
-        row=1, column=1, value="PARTIDAS CONCILIADAS POR LOTE (AGRUPADAS)"
-    ).font = font_title
+    ws_lote.cell(row=1, column=1, value=f"PARTIDAS CONCILIADAS POR LOTE / CUIT ({erp_seleccionado.upper()})").font = font_title
     headers_lote = [
-        "Grupo / Empresa",
+        "Razón Social / Empresa",
+        "CUIT",
         "Certificados ARCA Incluidos",
-        "Fecha ARCA",
+        "Rango Fecha ARCA",
         "Monto Total ARCA ($)",
-        "Asiento Mayor",
-        "Fecha Mayor",
-        "Monto Mayor ($)",
+        "Asientos Mayor Incluidos",
+        "Rango Fecha Mayor",
+        "Monto Total Mayor ($)",
         "Diferencia ($)",
         "Observaciones",
     ]
@@ -346,62 +457,58 @@ def procesar_archivos(file_m, file_a):
     r_lote_idx = 5
     for item in conciliadas_lote:
         ws_lote.cell(row=r_lote_idx, column=1, value=item["empresa"]).alignment = align_left
-        ws_lote.cell(row=r_lote_idx, column=2, value=item["certs_arca"]).alignment = align_center
-        ws_lote.cell(row=r_lote_idx, column=3, value=item["fecha_arca"]).alignment = align_center
+        ws_lote.cell(row=r_lote_idx, column=2, value=item["cuit"]).alignment = align_center
+        ws_lote.cell(row=r_lote_idx, column=3, value=item["certs_arca"]).alignment = align_center
+        ws_lote.cell(row=r_lote_idx, column=4, value=item["fecha_arca"]).alignment = align_center
         
-        c_m1 = ws_lote.cell(row=r_lote_idx, column=4, value=item["monto_arca"])
+        c_m1 = ws_lote.cell(row=r_lote_idx, column=5, value=item["monto_arca"])
         c_m1.number_format, c_m1.alignment = fmt_currency, align_right
 
-        ws_lote.cell(row=r_lote_idx, column=5, value=item["asientos_mayor"]).alignment = align_center
-        ws_lote.cell(row=r_lote_idx, column=6, value=item["fecha_mayor"]).alignment = align_center
+        ws_lote.cell(row=r_lote_idx, column=6, value=item["asientos_mayor"]).alignment = align_center
+        ws_lote.cell(row=r_lote_idx, column=7, value=item["fecha_mayor"]).alignment = align_center
 
-        c_m2 = ws_lote.cell(row=r_lote_idx, column=7, value=item["monto_mayor"])
+        c_m2 = ws_lote.cell(row=r_lote_idx, column=8, value=item["monto_mayor"])
         c_m2.number_format, c_m2.alignment = fmt_currency, align_right
 
-        c_diff = ws_lote.cell(row=r_lote_idx, column=8, value=f"=D{r_lote_idx}-G{r_lote_idx}")
+        c_diff = ws_lote.cell(row=r_lote_idx, column=9, value=f"=E{r_lote_idx}-H{r_lote_idx}")
         c_diff.number_format, c_diff.alignment = fmt_currency, align_right
 
-        ws_lote.cell(row=r_lote_idx, column=9, value=item["obs"]).alignment = align_left
+        ws_lote.cell(row=r_lote_idx, column=10, value=item["obs"]).alignment = align_left
 
-        for c in range(1, 10):
+        for c in range(1, 11):
             ws_lote.cell(row=r_lote_idx, column=c).font = font_regular
             ws_lote.cell(row=r_lote_idx, column=c).border = thin_border
         r_lote_idx += 1
 
-    ws_lote.cell(
-        row=r_lote_idx, column=1, value="TOTAL CONCILIADO POR LOTE"
-    ).font = font_bold
+    ws_lote.cell(row=r_lote_idx, column=1, value="TOTAL CONCILIADO POR LOTE").font = font_bold
 
     if r_lote_idx > 5:
-        c_lt1 = ws_lote.cell(row=r_lote_idx, column=4, value=f"=SUM(D5:D{r_lote_idx-1})")
-        c_lt2 = ws_lote.cell(row=r_lote_idx, column=7, value=f"=SUM(G5:G{r_lote_idx-1})")
-        c_ltdiff = ws_lote.cell(row=r_lote_idx, column=8, value=f"=SUM(H5:H{r_lote_idx-1})")
+        c_lt1 = ws_lote.cell(row=r_lote_idx, column=5, value=f"=SUM(E5:E{r_lote_idx-1})")
+        c_lt2 = ws_lote.cell(row=r_lote_idx, column=8, value=f"=SUM(H5:H{r_lote_idx-1})")
+        c_ltdiff = ws_lote.cell(row=r_lote_idx, column=9, value=f"=SUM(I5:I{r_lote_idx-1})")
     else:
-        c_lt1 = ws_lote.cell(row=r_lote_idx, column=4, value=0)
-        c_lt2 = ws_lote.cell(row=r_lote_idx, column=7, value=0)
-        c_ltdiff = ws_lote.cell(row=r_lote_idx, column=8, value=0)
+        c_lt1 = ws_lote.cell(row=r_lote_idx, column=5, value=0)
+        c_lt2 = ws_lote.cell(row=r_lote_idx, column=8, value=0)
+        c_ltdiff = ws_lote.cell(row=r_lote_idx, column=9, value=0)
 
     c_lt1.font, c_lt1.number_format, c_lt1.alignment = font_bold, fmt_currency, align_right
     c_lt2.font, c_lt2.number_format, c_lt2.alignment = font_bold, fmt_currency, align_right
     c_ltdiff.font, c_ltdiff.number_format, c_ltdiff.alignment = font_bold, fmt_currency, align_right
 
-    for c in range(1, 10):
+    for c in range(1, 11):
         ws_lote.cell(row=r_lote_idx, column=c).fill = fill_total
         ws_lote.cell(row=r_lote_idx, column=c).border = total_border
 
     row_lote_total = r_lote_idx
     cnt_lote = len(conciliadas_lote)
 
-    ws_arca.cell(
-        row=1,
-        column=1,
-        value="RETENCIONES PENDIENTES EN ARCA (NO REGISTRADAS EN MAYOR)",
-    ).font = font_title
+    ws_arca.cell(row=1, column=1, value="RETENCIONES PENDIENTES EN ARCA (NO REGISTRADAS EN MAYOR)").font = font_title
     headers_arca = [
         "Nro Certificado",
         "Fecha Reg.",
         "Tipo Comprobante",
         "Nro Comprobante",
+        "CUIT Agente",
         "Razón Social Agente",
         "Monto Retención ($)",
     ]
@@ -415,37 +522,36 @@ def procesar_archivos(file_m, file_a):
         ws_arca.cell(row=r_arca_idx, column=2, value=item["fecha_arca"]).alignment = align_center
         ws_arca.cell(row=r_arca_idx, column=3, value=item["tipo_comp"]).alignment = align_center
         ws_arca.cell(row=r_arca_idx, column=4, value=item["comp_arca"]).alignment = align_center
-        ws_arca.cell(row=r_arca_idx, column=5, value=item["razon_arca"]).alignment = align_left
-        c_m = ws_arca.cell(row=r_arca_idx, column=6, value=item["monto_arca"])
+        ws_arca.cell(row=r_arca_idx, column=5, value=item["cuit_arca"]).alignment = align_center
+        ws_arca.cell(row=r_arca_idx, column=6, value=item["razon_arca"]).alignment = align_left
+        
+        c_m = ws_arca.cell(row=r_arca_idx, column=7, value=item["monto_arca"])
         c_m.number_format, c_m.alignment = fmt_currency, align_right
 
-        for c in range(1, 7):
+        for c in range(1, 8):
             ws_arca.cell(row=r_arca_idx, column=c).font = font_regular
             ws_arca.cell(row=r_arca_idx, column=c).border = thin_border
         r_arca_idx += 1
 
     ws_arca.cell(row=r_arca_idx, column=1, value="TOTAL PENDIENTE ARCA").font = font_bold
-    c_totarca = ws_arca.cell(row=r_arca_idx, column=6, value=f"=SUM(F4:F{r_arca_idx-1})")
+    c_totarca = ws_arca.cell(row=r_arca_idx, column=7, value=f"=SUM(G4:G{r_arca_idx-1})")
     c_totarca.font, c_totarca.number_format, c_totarca.alignment = font_bold, fmt_currency, align_right
 
-    for c in range(1, 7):
+    for c in range(1, 8):
         ws_arca.cell(row=r_arca_idx, column=c).fill = fill_total
         ws_arca.cell(row=r_arca_idx, column=c).border = total_border
 
     row_arca_total = r_arca_idx
     cnt_arca = len(pendientes_arca)
 
-    ws_mayor.cell(
-        row=1,
-        column=1,
-        value="REGISTROS PENDIENTES EN MAYOR (SIN CERTIFICADO EN ARCA)",
-    ).font = font_title
+    ws_mayor.cell(row=1, column=1, value=f"REGISTROS PENDIENTES EN MAYOR ({erp_seleccionado.upper()})").font = font_title
     headers_mayor = [
         "Nro Asiento",
         "Fecha Contable",
-        "Detalle",
-        "Referencia",
-        "Cuenta / Descripción",
+        "Detalle / Concepto",
+        "Referencia / NroComp",
+        "CUIT Cliente/Prov",
+        "Razón Social / Cuenta",
         "Monto Registrado ($)",
     ]
     for col_idx, text in enumerate(headers_mayor, 1):
@@ -458,31 +564,29 @@ def procesar_archivos(file_m, file_a):
         ws_mayor.cell(row=r_mayor_idx, column=2, value=item["fecha_mayor"]).alignment = align_center
         ws_mayor.cell(row=r_mayor_idx, column=3, value=item["detalle_mayor"]).alignment = align_left
         ws_mayor.cell(row=r_mayor_idx, column=4, value=item["ref_mayor"]).alignment = align_center
-        ws_mayor.cell(row=r_mayor_idx, column=5, value=item["razon_mayor"]).alignment = align_left
-        c_m = ws_mayor.cell(row=r_mayor_idx, column=6, value=item["monto_mayor"])
+        ws_mayor.cell(row=r_mayor_idx, column=5, value=item["cuit_mayor"]).alignment = align_center
+        ws_mayor.cell(row=r_mayor_idx, column=6, value=item["razon_mayor"]).alignment = align_left
+        
+        c_m = ws_mayor.cell(row=r_mayor_idx, column=7, value=item["monto_mayor"])
         c_m.number_format, c_m.alignment = fmt_currency, align_right
 
-        for c in range(1, 7):
+        for c in range(1, 8):
             ws_mayor.cell(row=r_mayor_idx, column=c).font = font_regular
             ws_mayor.cell(row=r_mayor_idx, column=c).border = thin_border
         r_mayor_idx += 1
 
     ws_mayor.cell(row=r_mayor_idx, column=1, value="TOTAL PENDIENTE MAYOR").font = font_bold
-    c_totmayor = ws_mayor.cell(row=r_mayor_idx, column=6, value=f"=SUM(F4:F{r_mayor_idx-1})")
+    c_totmayor = ws_mayor.cell(row=r_mayor_idx, column=7, value=f"=SUM(G4:G{r_mayor_idx-1})")
     c_totmayor.font, c_totmayor.number_format, c_totmayor.alignment = font_bold, fmt_currency, align_right
 
-    for c in range(1, 7):
+    for c in range(1, 8):
         ws_mayor.cell(row=r_mayor_idx, column=c).fill = fill_total
         ws_mayor.cell(row=r_mayor_idx, column=c).border = total_border
 
     row_mayor_total = r_mayor_idx
     cnt_mayor = len(pendientes_mayor)
 
-    ws_resumen.cell(
-        row=1,
-        column=1,
-        value="CONCILIACIÓN DE RETENCIONES - RESUMEN CONSOLIDADO",
-    ).font = font_title
+    ws_resumen.cell(row=1, column=1, value=f"CONCILIACIÓN DE RETENCIONES - MAYOR {erp_seleccionado.upper()} VS ARCA").font = font_title
     headers_resumen = [
         "Categoría / Pestaña",
         "Cantidad de Reg.",
@@ -498,21 +602,21 @@ def procesar_archivos(file_m, file_a):
         (
             "1. Conciliaciones Exactas (1 a 1)",
             cnt_1a1,
-            f"='Conciliadas 1a1'!E{row_1a1_total}",
-            f"='Conciliadas 1a1'!J{row_1a1_total}",
+            f"='Conciliadas 1a1'!F{row_1a1_total}",
+            f"='Conciliadas 1a1'!L{row_1a1_total}",
             "=C5-D5",
         ),
         (
-            "2. Conciliaciones por Lote (N a 1)",
+            "2. Conciliaciones por Lote / CUIT",
             cnt_lote,
-            f"='Conciliadas por Lote'!D{row_lote_total}",
-            f"='Conciliadas por Lote'!G{row_lote_total}",
+            f"='Conciliadas por Lote'!E{row_lote_total}",
+            f"='Conciliadas por Lote'!H{row_lote_total}",
             "=C6-D6",
         ),
         (
             "3. Pendientes en ARCA (Sin Mayor)",
             cnt_arca,
-            f"=Pendientes_ARCA!F{row_arca_total}",
+            f"=Pendientes_ARCA!G{row_arca_total}",
             0,
             "=C7-D7",
         ),
@@ -520,7 +624,7 @@ def procesar_archivos(file_m, file_a):
             "4. Pendientes en MAYOR (Sin ARCA)",
             cnt_mayor,
             0,
-            f"=Pendientes_MAYOR!F{row_mayor_total}",
+            f"=Pendientes_MAYOR!G{row_mayor_total}",
             "=C8-D8",
         ),
     ]
@@ -560,6 +664,7 @@ def procesar_archivos(file_m, file_a):
         ws_resumen.cell(row=9, column=c).fill = fill_total
         ws_resumen.cell(row=9, column=c).border = total_border
 
+    # Ajuste automático del ancho de columnas
     for ws in wb.worksheets:
         for col in ws.columns:
             max_len = 0
@@ -576,17 +681,111 @@ def procesar_archivos(file_m, file_a):
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
-    return output
+    
+    # Retornar tanto el Excel como los resúmenes para mostrar en Streamlit
+    stats = {
+        "cnt_1a1": cnt_1a1,
+        "cnt_lote": cnt_lote,
+        "cnt_arca": cnt_arca,
+        "cnt_mayor": cnt_mayor,
+        "conciliadas_1a1": conciliadas_1a1,
+        "conciliadas_lote": conciliadas_lote,
+        "pendientes_arca": pendientes_arca,
+        "pendientes_mayor": pendientes_mayor,
+    }
+    
+    return output, stats
 
+
+st.title("📊 Conciliador Contable de Retenciones (ARCA vs ERP)")
+st.markdown(
+    "Selecciona el **ERP de origen**, carga los reportes de **Mayor** y **Mis Retenciones (ARCA)**, "
+    "y genera el cruce automático con validación por **CUIT y Razón Social**."
+)
+
+with st.sidebar:
+    st.header("⚙️ Configuración del Cruce")
+    erp_seleccionado = st.radio(
+        "Selecciona el ERP del Mayor:",
+        options=["AutoDealer", "Bejerman"],
+        help="Adapta dinámicamente las referencias de los encabezados según el sistema contable emisor."
+    )
+    
+    st.markdown("---")
+    st.markdown("### 📌 Mapeo activo")
+    cfg = ERP_CONFIGS[erp_seleccionado]
+    st.caption(f"**Asiento:** `{cfg.get('asiento')}`")
+    st.caption(f"**Fecha:** `{cfg.get('fecha')}`")
+    st.caption(f"**Detalle / Concepto:** `{cfg.get('detalle')}`")
+    st.caption(f"**Referencia:** `{cfg.get('referencia')}`")
+    if cfg.get("ref_secundaria"):
+        st.caption(f"**Ref Secundario:** `{cfg.get('ref_secundaria')}`")
+    st.caption(f"**Razón Social:** `{cfg.get('entidad')}`")
+    st.caption(f"**CUIT:** `{cfg.get('cuit')}`")
+    st.caption(f"**Debe:** `{cfg.get('debe')}` | **Haber:** `{cfg.get('haber')}`")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    file_mayor = st.file_uploader(
+        f"Subir Mayor.xlsx ({erp_seleccionado})", type=["xlsx", "xls"], key="mayor"
+    )
+
+with col2:
+    file_arca = st.file_uploader(
+        "Subir MisRetenciones.xlsx (ARCA)", type=["xlsx", "xls"], key="arca"
+    )
 
 if file_mayor and file_arca:
-    if st.button("⚙️ Procesar Conciliación", type="primary"):
-        with st.spinner("Procesando datos y armando informe..."):
-            excel_bytes = procesar_archivos(file_mayor, file_arca)
-            st.success("✅ ¡Conciliación completada!")
+    st.info(f"💡 Listo para realizar el cruce utilizando la estructura de **{erp_seleccionado}**.")
+    
+    if st.button("⚙️ Procesar Conciliación", type="primary", use_container_width=True):
+        with st.spinner("Procesando retenciones y aplicando cruce por CUIT..."):
+            excel_bytes, stats = procesar_archivos(file_mayor, file_arca, erp_seleccionado)
+            
+            st.success("✅ ¡Conciliación completada con éxito!")
+            
+            # Métricas rápidas en la UI
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Conciliados 1 a 1", stats["cnt_1a1"])
+            m2.metric("Conciliados por Lote", stats["cnt_lote"])
+            m3.metric("Pendientes ARCA", stats["cnt_arca"])
+            m4.metric("Pendientes Mayor", stats["cnt_mayor"])
+
             st.download_button(
-                label="📥 Descargar Archivo Excel Conciliado",
+                label="📥 Descargar Reporte Conciliado en Excel",
                 data=excel_bytes,
-                file_name="Conciliacion_Retenciones.xlsx",
+                file_name=f"Conciliacion_Retenciones_{erp_seleccionado}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
             )
+
+            # Previsualización interactiva en Streamlit
+            st.markdown("### 🔍 Previsualización de Resultados")
+            tab1, tab2, tab3, tab4 = st.tabs([
+                "Exactas 1a1", "Por Lote / CUIT", "Pendientes ARCA", "Pendientes Mayor"
+            ])
+
+            with tab1:
+                if stats["conciliadas_1a1"]:
+                    st.dataframe(pd.DataFrame(stats["conciliadas_1a1"]), use_container_width=True)
+                else:
+                    st.info("No se encontraron registros 1 a 1 exactos.")
+
+            with tab2:
+                if stats["conciliadas_lote"]:
+                    st.dataframe(pd.DataFrame(stats["conciliadas_lote"]), use_container_width=True)
+                else:
+                    st.info("No se encontraron registros acumulados por lote.")
+
+            with tab3:
+                if stats["pendientes_arca"]:
+                    st.dataframe(pd.DataFrame(stats["pendientes_arca"]), use_container_width=True)
+                else:
+                    st.success("🎉 ¡No hay retenciones pendientes en ARCA!")
+
+            with tab4:
+                if stats["pendientes_mayor"]:
+                    st.dataframe(pd.DataFrame(stats["pendientes_mayor"]), use_container_width=True)
+                else:
+                    st.success("🎉 ¡No hay registros pendientes en el Mayor!")
