@@ -118,90 +118,44 @@ def obtener_monto_mayor(row, cols_config):
     
     return 0.0
 
-def convertir_a_xlsx(uploaded_file):
+def validar_formato_archivo(uploaded_file):
     """
-    Detecta si el archivo es .xls o un HTML encubierto (muy común en reportes de AFIP/ARCA)
-    y lo convierte a un objeto .xlsx en memoria para procesarlo uniformemente.
-    Mejorado para soportar múltiples codificaciones y reportar errores de librerías.
+    Verifica que el archivo sea un Excel válido (.xlsx).
+    Si es .xls o no se puede leer, lanza un error amigable.
     """
     filename = uploaded_file.name.lower()
-    if filename.endswith('.xlsx'):
-        return uploaded_file
     
-    uploaded_file.seek(0)
+    if filename.endswith('.xls'):
+        raise ValueError(
+            f"El archivo '{uploaded_file.name}' está en formato '.xls' (formato antiguo de Excel o archivo web de AFIP/ARCA). "
+            f"Por favor, abre el archivo en Excel y guárdalo usando la opción 'Guardar como...' eligiendo el formato "
+            f"'Libro de Excel (*.xlsx)' antes de subirlo aquí."
+        )
     
-    # Intento 1: Leer como archivo Excel binario antiguo (.xls) usando xlrd si estuviera disponible
-    # Pandas por defecto intenta con xlrd para .xls
+    # Verificamos si realmente es un xlsx intentando leer una pequeña parte
     try:
-        df = pd.read_excel(uploaded_file)
-    except Exception as e_excel:
-        # Intento 2: Archivo HTML guardado con extensión .xls (clásico de AFIP)
-        uploaded_file.seek(0)
-        raw_bytes = uploaded_file.getvalue()
-        
-        # Probamos distintas codificaciones comunes en Argentina
-        encodings = ['utf-8', 'latin1', 'cp1252']
-        html_content = None
-        
-        for enc in encodings:
-            try:
-                html_content = raw_bytes.decode(enc)
-                break # Si decodifica bien, salimos del loop
-            except UnicodeDecodeError:
-                continue
-                
-        if not html_content:
-            # Fallback si ninguna codificación funciona perfecto
-            html_content = raw_bytes.decode('latin1', errors='replace')
-
-        try:
-            # Intentar primero con lxml que suele ser el predeterminado
-            try:
-                dfs = pd.read_html(io.StringIO(html_content), flavor='lxml')
-            except ImportError:
-                # Si falla, intentar con bs4/html5lib si está disponible
-                try:
-                    dfs = pd.read_html(io.StringIO(html_content), flavor='html5lib')
-                except ImportError:
-                    # Intento final genérico, a veces pandas lo resuelve
-                    dfs = pd.read_html(io.StringIO(html_content))
-            
-            if not dfs:
-                raise ValueError("No se encontraron tablas de datos legibles en el archivo HTML encubierto.")
-            df = dfs[0] # Usualmente AFIP pone todo en la primera tabla
-        except ImportError:
-            raise ImportError(
-                "Falta librería para leer el archivo de AFIP. "
-                "Por favor, asegúrate de instalar las dependencias ejecutando:\n"
-                "pip install lxml html5lib"
-            )
-        except ValueError as ve:
-            # Esto atrapa el "No tables found" de pandas
-            raise ValueError(f"El archivo parece ser HTML pero Pandas no encontró tablas legibles. {str(ve)}")
-        except Exception as e_html:
-            raise ValueError(
-                f"No se pudo leer el archivo '{uploaded_file.name}'.\n"
-                f"Asegúrate de que el archivo no esté corrupto.\n"
-                f"Detalle técnico: {e_html}"
-            )
-
-    # Crear un BytesIO con el formato moderno .xlsx
-    output = io.BytesIO()
-    df.to_excel(output, index=False, engine='openpyxl')
-    output.seek(0)
-    output.name = filename + "x"
-    return output
+        # Intentamos leer solo la primera fila para validar el formato rápido
+        pd.read_excel(uploaded_file, nrows=1)
+    except Exception as e:
+         raise ValueError(
+            f"El archivo '{uploaded_file.name}' parece estar corrupto o no es un formato de Excel válido (.xlsx). "
+            f"Si lo descargaste de ARCA/AFIP, por favor ábrelo en Excel y guárdalo como 'Libro de Excel (*.xlsx)'."
+        )
+    
+    # Reseteamos el puntero del archivo después de la prueba de lectura
+    uploaded_file.seek(0)
+    return uploaded_file
 
 
 def procesar_archivos(file_m, file_a, erp_seleccionado):
     config_erp = ERP_CONFIGS.get(erp_seleccionado, ERP_CONFIGS["AutoDealer"])
     
-    # Convertir automáticamente si detecta formato .xls
-    file_m_xlsx = convertir_a_xlsx(file_m)
-    file_a_xlsx = convertir_a_xlsx(file_a)
+    # Validamos ambos archivos ANTES de procesarlos
+    validar_formato_archivo(file_m)
+    validar_formato_archivo(file_a)
     
-    df_mayor = pd.read_excel(file_m_xlsx).dropna(how="all")
-    df_arca = pd.read_excel(file_a_xlsx).dropna(how="all")
+    df_mayor = pd.read_excel(file_m).dropna(how="all")
+    df_arca = pd.read_excel(file_a).dropna(how="all")
 
     # Mapeo dinámico de nombres de columnas de ARCA
     col_cuit_arca = buscar_columna_arca(df_arca, ["CUIT Agente Ret./Perc.", "CUIT Agente", "CUIT"])
@@ -778,11 +732,13 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     return output, stats
 
 
-st.title("📊 Conciliador Contable de Impuestos (ARCA vs ERP)")
+st.title("📊 Conciliador Contable de Retenciones (ARCA vs ERP)")
 st.markdown(
     "Selecciona el **ERP de origen**, carga los reportes de **Mayor** y **Mis Retenciones (ARCA)**, "
     "y genera el cruce automático con validación por **CUIT y Razón Social**."
 )
+
+st.warning("⚠️ **ATENCIÓN:** Solo se admiten archivos en formato moderno **.xlsx**. Si tus archivos son `.xls` (muy común en ARCA/AFIP), ábrelos en Excel y guárdalos como `.xlsx` antes de subirlos.", icon="⚠️")
 
 with st.sidebar:
     st.header("⚙️ Configuración del Cruce")
@@ -809,12 +765,12 @@ col1, col2 = st.columns(2)
 
 with col1:
     file_mayor = st.file_uploader(
-        f"Subir Mayor.xlsx ({erp_seleccionado})", type=["xlsx", "xls"], key="mayor"
+        f"Subir Mayor (.xlsx) ({erp_seleccionado})", type=["xlsx"], key="mayor"
     )
 
 with col2:
     file_arca = st.file_uploader(
-        "Subir MisRetenciones.xlsx (ARCA)", type=["xlsx", "xls"], key="arca"
+        "Subir MisRetenciones (.xlsx) (ARCA)", type=["xlsx"], key="arca"
     )
 
 if file_mayor and file_arca:
@@ -871,5 +827,8 @@ if file_mayor and file_arca:
                         st.dataframe(pd.DataFrame(stats["pendientes_mayor"]), use_container_width=True)
                     else:
                         st.success("🎉 ¡No hay registros pendientes en el Mayor!")
+            except ValueError as ve:
+                # Mostramos errores de validación (como el formato incorrecto) de forma más amigable
+                st.error(f"⚠️ {str(ve)}", icon="🛑")
             except Exception as error:
-                st.error(f"❌ Ocurrió un error al procesar los archivos: {str(error)}")
+                st.error(f"❌ Ocurrió un error inesperado al procesar los archivos: {str(error)}", icon="❌")
