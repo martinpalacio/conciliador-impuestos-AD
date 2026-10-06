@@ -1,5 +1,5 @@
 # Required dependencies for this script to run fully:
-# pip install streamlit pandas openpyxl lxml html5lib
+# pip install streamlit pandas openpyxl lxml html5lib xlrd
 import io
 import math
 import re
@@ -732,15 +732,67 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     return output, stats
 
 
-def parse_autodealer_txt(file_bytes):
+def parse_autodealer_xls(file_bytes):
     """
-    Interpreta un archivo TXT/PRN desestructurado línea por línea, separando los
-    datos en columnas mediante expresiones regulares (Regex) de forma determinista.
+    Interpreta un archivo .xls (que puede ser un reporte de texto disfrazado de Excel,
+    o un Excel binario real) extrayendo sus datos línea por línea o fila por fila.
     """
-    content = file_bytes.read().decode('utf-8', errors='ignore')
+    file_bytes.seek(0)
+    is_text = False
+    lines = []
+    
+    # 1. Intentar leerlo como texto plano (muy común en ERPs viejos que exportan a .xls)
+    try:
+        content = file_bytes.read().decode('utf-8')
+        lines = content.splitlines()
+        if len(lines) > 0 and "" not in lines[0]:
+            is_text = True
+    except UnicodeDecodeError:
+        try:
+            file_bytes.seek(0)
+            content = file_bytes.read().decode('latin-1')
+            lines = content.splitlines()
+            if len(lines) > 0:
+                is_text = True
+        except Exception:
+            pass
+            
+    # 2. Si no es texto, leerlo como Excel real usando Pandas
+    if not is_text or not lines:
+        file_bytes.seek(0)
+        try:
+            # Usa xlrd para leer el formato viejo .xls
+            df_raw = pd.read_excel(file_bytes, header=None, dtype=str, engine="xlrd")
+        except Exception:
+            # Fallback por si acaso es .xlsx u otro formato soportado
+            file_bytes.seek(0)
+            try:
+                df_raw = pd.read_excel(file_bytes, header=None, dtype=str)
+            except Exception:
+                # Fallback final a HTML disfrazado
+                file_bytes.seek(0)
+                df_raw = pd.read_html(file_bytes)[0]
+        
+        lines = []
+        # Reconstruimos las filas del dataframe a texto para usar el motor de Regex
+        for _, row in df_raw.iterrows():
+            row_vals = []
+            for val in row.values:
+                if pd.notna(val) and str(val).strip() and str(val).lower() != 'nan':
+                    v_str = str(val).strip()
+                    # Normalizar fechas generadas por pandas de ser necesario
+                    if re.match(r'^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?$', v_str):
+                        try:
+                            v_str = pd.to_datetime(v_str).strftime('%d/%m/%Y')
+                        except:
+                            pass
+                    row_vals.append(v_str)
+            if row_vals:
+                lines.append(" ".join(row_vals))
+
     data = []
     
-    for line in content.splitlines():
+    for line in lines:
         line = line.strip()
         # Patrón inicial: Validamos que la línea empiece con un Asiento y una Fecha sí o sí
         if not re.search(r'^\d+\s+\d{2}/\d{2}/\d{4}', line):
@@ -768,7 +820,8 @@ def parse_autodealer_txt(file_bytes):
             resto = resto.replace(detalle, "", 1).strip()
             
         # 4. Extraemos todos los montos con decimales desde el texto restante
-        amt_pattern = r'\b\d{1,3}(?:\.\d{3})*,\d{2}\b'
+        # Usamos un patrón flexible para soportar formatos con comas, puntos o reconstruidos por pandas
+        amt_pattern = r'\b(?:\d{1,3}(?:[.,]\d{3})+|\d+)[.,]\d{1,2}\b'
         montos = re.findall(amt_pattern, resto)
         
         # Quitamos los montos del texto para aislar la Entidad y el Centro de Costo
@@ -826,7 +879,7 @@ def parse_autodealer_txt(file_bytes):
 st.sidebar.title("🛠️ Herramientas")
 modo_app = st.sidebar.radio(
     "Selecciona un módulo:", 
-    ["🔄 Conciliador de Retenciones", "✨ Formatear Mayor (TXT)"]
+    ["🔄 Conciliador de Retenciones", "✨ Formatear Mayor (XLS)"]
 )
 st.sidebar.markdown("---")
 
@@ -929,22 +982,22 @@ if modo_app == "🔄 Conciliador de Retenciones":
                 except Exception as error:
                     st.error(f"❌ Ocurrió un error inesperado al procesar los archivos: {str(error)}", icon="❌")
 
-elif modo_app == "✨ Formatear Mayor (TXT)":
+elif modo_app == "✨ Formatear Mayor (XLS)":
     st.title("✨ Formateador Automático de Mayor (AutoDealer)")
     st.markdown(
-        "Sube tu archivo crudo **.txt o .prn** exportado del sistema. "
+        "Sube tu archivo crudo **.xls** exportado del sistema. "
         "El motor inteligente extraerá números de comprobante, entidades sociales de longitud variable y montos, "
-        "generando un **Excel tabulado** listo para el conciliador."
+        "generando un **Excel tabulado (.xlsx)** listo para el conciliador."
     )
     
-    file_txt = st.file_uploader("📂 Sube el archivo crudo del Mayor", type=["txt", "prn", "csv"])
+    file_xls = st.file_uploader("📂 Sube el archivo crudo del Mayor", type=["xls", "xlsx", "txt", "prn"])
     
-    if file_txt:
+    if file_xls:
         st.info("💡 Archivo leído. Listo para ser interpretado y estructurado.")
         if st.button("🪄 Ejecutar Formateo", type="primary", use_container_width=True):
             with st.spinner("Desglosando registros del mayor y limpiando columnas..."):
                 try:
-                    excel_formateado = parse_autodealer_txt(file_txt)
+                    excel_formateado = parse_autodealer_xls(file_xls)
                     st.success("✅ ¡Archivo procesado y estructurado con éxito!")
                     
                     st.download_button(
