@@ -1,6 +1,5 @@
 # Required dependencies for this script to run fully:
 # pip install streamlit pandas openpyxl lxml html5lib xlrd
-pip install "xlrd>=2.0.1"
 import io
 import math
 import re
