@@ -3,6 +3,8 @@
 import io
 import math
 import re
+from datetime import datetime
+
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -40,6 +42,9 @@ ERP_CONFIGS = {
         "saldo": "ImpTotal_Loc",
     }
 }
+
+SIN_RAZON_SOCIAL = "NO ENCONTRADO EN PADRÓN"
+
 
 def safe_float(val):
     """
@@ -96,10 +101,14 @@ def buscar_columna_arca(df_arca, posibles_nombres):
     return posibles_nombres[0] if posibles_nombres else ""
 
 
-def obtener_monto_mayor(row, cols_config):
+def obtener_monto_mayor(row, cols_config, priorizar_total=False):
     """
     Obtiene el monto del registro del Mayor evaluando DEBE, HABER y SALDO
     según la configuración de columnas del ERP activo.
+
+    Si priorizar_total=True (módulo de percepciones IIBB) se toma primero la columna
+    de total con signo (ImpTotal_Loc en Bejerman), donde las NC ya vienen en negativo.
+    Si esa columna está vacía/0 se cae a la lógica habitual DEBE / HABER.
     """
     col_debe = cols_config.get("debe", "DEBE")
     col_haber = cols_config.get("haber", "HABER")
@@ -109,13 +118,16 @@ def obtener_monto_mayor(row, cols_config):
     haber = safe_float(row.get(col_haber))
     saldo = safe_float(row.get(col_saldo))
 
+    if priorizar_total and saldo != 0:
+        return round(saldo, 2)
+
     if debe != 0:
         return round(debe, 2)
     elif haber != 0:
         return round(-abs(haber), 2)
     elif saldo != 0:
         return round(saldo, 2)
-    
+
     return 0.0
 
 def validar_formato_archivo(uploaded_file):
@@ -124,14 +136,14 @@ def validar_formato_archivo(uploaded_file):
     Si es .xls o no se puede leer, lanza un error amigable.
     """
     filename = uploaded_file.name.lower()
-    
+
     if filename.endswith('.xls'):
         raise ValueError(
             f"El archivo '{uploaded_file.name}' está en formato '.xls' (formato antiguo de Excel o archivo web de AFIP/ARCA). "
             f"Por favor, abre el archivo en Excel y guárdalo usando la opción 'Guardar como...' eligiendo el formato "
             f"'Libro de Excel (*.xlsx)' antes de subirlo aquí."
         )
-    
+
     # Verificamos si realmente es un xlsx intentando leer una pequeña parte
     try:
         # Intentamos leer solo la primera fila para validar el formato rápido
@@ -141,30 +153,195 @@ def validar_formato_archivo(uploaded_file):
             f"El archivo '{uploaded_file.name}' parece estar corrupto o no es un formato de Excel válido (.xlsx). "
             f"Si lo descargaste de ARCA/AFIP, por favor ábrelo en Excel y guárdalo como 'Libro de Excel (*.xlsx)'."
         )
-    
+
     # Reseteamos el puntero del archivo después de la prueba de lectura
     uploaded_file.seek(0)
     return uploaded_file
 
 
-def procesar_archivos(file_m, file_a, erp_seleccionado):
-    config_erp = ERP_CONFIGS.get(erp_seleccionado, ERP_CONFIGS["AutoDealer"])
-    
-    # Validamos ambos archivos ANTES de procesarlos
-    validar_formato_archivo(file_m)
-    validar_formato_archivo(file_a)
-    
-    df_mayor = pd.read_excel(file_m).dropna(how="all")
-    df_arca = pd.read_excel(file_a).dropna(how="all")
+# ---------------------------------------------------------------------------
+# MÓDULO NUEVO: PERCEPCIONES IIBB (txt del sistema)
+# ---------------------------------------------------------------------------
 
-    # Mapeo dinámico de nombres de columnas de ARCA
-    col_cuit_arca = buscar_columna_arca(df_arca, ["CUIT Agente Ret./Perc.", "CUIT Agente", "CUIT"])
-    col_cert_arca = buscar_columna_arca(df_arca, ["Número Certificado", "Nro Certificado", "Certificado"])
-    col_fecha_arca = buscar_columna_arca(df_arca, ["Fecha Ret./Perc.", "Fecha Registro", "Fecha"])
-    col_comp_arca = buscar_columna_arca(df_arca, ["Número Comprobante", "Nro Comprobante", "Comprobante"])
-    col_razon_arca = buscar_columna_arca(df_arca, ["Denominación o Razón Social", "Razon Social", "Denominacion"])
-    col_monto_arca = buscar_columna_arca(df_arca, ["Importe Ret./Perc.", "Importe", "Monto"])
-    col_tipo_arca = buscar_columna_arca(df_arca, ["Descripción Comprobante", "Tipo Comprobante"])
+# Formato por defecto del sistema (ancho fijo):
+# JJJ CUIT(13) FECHA(10) PV(4) NRO(8) COMPROBANTE(1) TIPO(1) MONTO
+# Ej: 90130-50000173-501/10/2025700000095099O 00023732,45
+RE_PERCEPCION_FIJO = re.compile(
+    r'^(\d{3})(\d{2}-\d{8}-\d)(\d{2}/\d{2}/\d{4})(\d{4})(\d{8})([A-Z])([A-Z ])(\S+)$'
+)
+RE_CUIT_GUIONES = re.compile(r'^\d{2}-\d{8}-\d$')
+
+
+def decodificar_texto(raw):
+    """Decodifica bytes de un txt: UTF-8 y, si falla, Latin-1 (típico de Bejerman/ERPs)."""
+    for enc in ("utf-8-sig", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1", errors="ignore")
+
+
+def parse_monto_txt(s):
+    """
+    Convierte '00023732,45' / '4755,6' / '-0001234,50' a float.
+    Las notas de crédito vienen con signo negativo: se respeta el signo.
+    """
+    s = str(s).strip()
+    negativo = "-" in s or "(" in s
+    t = re.sub(r'[^\d,.]', '', s)
+    if "," in t:
+        t = t.replace(".", "").replace(",", ".")
+    try:
+        v = float(t)
+    except ValueError:
+        return 0.0
+    return -abs(v) if negativo else v
+
+
+def _fecha_a_dt(fecha_str):
+    return datetime.strptime(fecha_str.strip(), "%d/%m/%Y")
+
+
+def parse_percepciones_txt(raw):
+    """
+    Interpreta el .txt de percepciones IIBB y devuelve un DataFrame con:
+    Jurisdicción, CUIT, Fecha, Nro Referencia, Nro Comprobante, Comprobante,
+    Tipo Comprobante, Monto.
+
+    Lee el formato de ancho fijo (primer bloque del sistema). Si el archivo no tiene
+    líneas en ese formato, intenta leer el formato ya tabulado (separado por tabs).
+    Si el archivo trae ambos bloques, se usa solo el de ancho fijo para no duplicar.
+    """
+    lineas = decodificar_texto(raw).splitlines()
+    registros = []
+
+    # 1) Formato de ancho fijo
+    for linea in lineas:
+        m = RE_PERCEPCION_FIJO.match(linea.strip())
+        if not m:
+            continue
+        jur, cuit, fecha, ref, nro, comp, tipo, monto = m.groups()
+        registros.append((jur, cuit, fecha, int(ref), int(nro), comp, tipo.strip(), parse_monto_txt(monto)))
+
+    # 2) Fallback: formato tabulado
+    if not registros:
+        for linea in lineas:
+            partes = linea.split("\t")
+            if len(partes) < 8:
+                continue
+            jur, cuit = partes[0].strip(), partes[1].strip()
+            if not (re.fullmatch(r'\d{3}', jur) and RE_CUIT_GUIONES.match(cuit)):
+                continue
+            try:
+                fecha = _fecha_a_dt(partes[2]).strftime("%d/%m/%Y")
+                registros.append((jur, cuit, fecha, int(partes[3]), int(partes[4]),
+                                  partes[5].strip(), partes[6].strip(), parse_monto_txt(partes[7])))
+            except ValueError:
+                continue
+
+    df = pd.DataFrame(registros, columns=[
+        "Jurisdicción", "CUIT", "Fecha", "Nro Referencia", "Nro Comprobante",
+        "Comprobante", "Tipo Comprobante", "Monto",
+    ])
+    return df
+
+
+def cargar_padron_proveedores(raw):
+    """
+    Lee el listado de proveedores (txt separado por tabs: Cód., Razón Social,
+    Tipo Docum., Nro. Docum.) y devuelve {cuit_solo_digitos: razon_social}.
+    Si un CUIT está repetido se usa el primero.
+    """
+    texto = decodificar_texto(raw)
+    df = pd.read_csv(io.StringIO(texto), sep="\t", dtype=str)
+    col_rs = next((c for c in df.columns if "raz" in str(c).lower()), df.columns[1])
+    col_doc = next((c for c in df.columns if "nro" in str(c).lower()), df.columns[-1])
+
+    padron = {}
+    for rs, doc in zip(df[col_rs], df[col_doc]):
+        k = clean_cuit(doc)
+        if k and k not in padron and pd.notna(rs):
+            padron[k] = str(rs).strip()
+    return padron
+
+
+def agregar_razon_social(df, padron):
+    df = df.copy()
+    df["Razón Social"] = df["CUIT"].apply(lambda c: padron.get(clean_cuit(c), SIN_RAZON_SOCIAL))
+    return df
+
+
+def construir_df_motor(df):
+    """
+    Adapta el DataFrame de percepciones al formato que consume el motor de conciliación
+    (mismas columnas que un reporte de ARCA), para que la lógica de cruce sea idéntica.
+    El orden de columnas importa: 'Número Comprobante' va antes que 'Descripción Comprobante'.
+    """
+    df = df.reset_index(drop=True)
+    return pd.DataFrame({
+        "CUIT Agente Ret./Perc.": df["CUIT"],
+        "Número Certificado": df["Nro Comprobante"].astype(str),
+        "Fecha Ret./Perc.": df["Fecha"].apply(lambda f: _fecha_a_dt(f).strftime("%Y-%m-%d")),
+        "Número Comprobante": (
+            df["Nro Referencia"].astype(str).str.zfill(4) + "-" + df["Nro Comprobante"].astype(str).str.zfill(8)
+        ),
+        "Descripción Comprobante": df["Comprobante"].astype(str) + df["Tipo Comprobante"].astype(str),
+        "Denominación o Razón Social": df["Razón Social"],
+        "Importe Ret./Perc.": df["Monto"],
+    })
+
+
+# ---------------------------------------------------------------------------
+# MOTOR DE CONCILIACIÓN
+# ---------------------------------------------------------------------------
+
+def procesar_archivos(
+    file_m,
+    file_a,
+    erp_seleccionado,
+    df_arca_override=None,
+    origen_label="ARCA",
+    concepto="RETENCIONES",
+    subtitulo="",
+    priorizar_total_mayor=False,
+):
+    """
+    Concilia el Mayor contra un reporte externo.
+
+    - Modo ARCA (por defecto): file_a es el Excel de MisRetenciones.
+    - Modo IIBB: se pasa df_arca_override (ya normalizado con construir_df_motor),
+      origen_label="IIBB", concepto="PERCEPCIONES IIBB" y priorizar_total_mayor=True.
+    La lógica de cruce (1 a 1, lote por CUIT, lote por Razón Social) es la misma en ambos.
+    """
+    config_erp = ERP_CONFIGS.get(erp_seleccionado, ERP_CONFIGS["AutoDealer"])
+    ORI = origen_label
+
+    # Validamos los archivos Excel ANTES de procesarlos
+    validar_formato_archivo(file_m)
+    df_mayor = pd.read_excel(file_m).dropna(how="all")
+
+    if df_arca_override is None:
+        validar_formato_archivo(file_a)
+        df_arca = pd.read_excel(file_a).dropna(how="all")
+
+        # Mapeo dinámico de nombres de columnas de ARCA
+        col_cuit_arca = buscar_columna_arca(df_arca, ["CUIT Agente Ret./Perc.", "CUIT Agente", "CUIT"])
+        col_cert_arca = buscar_columna_arca(df_arca, ["Número Certificado", "Nro Certificado", "Certificado"])
+        col_fecha_arca = buscar_columna_arca(df_arca, ["Fecha Ret./Perc.", "Fecha Registro", "Fecha"])
+        col_comp_arca = buscar_columna_arca(df_arca, ["Número Comprobante", "Nro Comprobante", "Comprobante"])
+        col_razon_arca = buscar_columna_arca(df_arca, ["Denominación o Razón Social", "Razon Social", "Denominacion"])
+        col_monto_arca = buscar_columna_arca(df_arca, ["Importe Ret./Perc.", "Importe", "Monto"])
+        col_tipo_arca = buscar_columna_arca(df_arca, ["Descripción Comprobante", "Tipo Comprobante"])
+    else:
+        df_arca = df_arca_override.copy().dropna(how="all")
+        col_cuit_arca = "CUIT Agente Ret./Perc."
+        col_cert_arca = "Número Certificado"
+        col_fecha_arca = "Fecha Ret./Perc."
+        col_comp_arca = "Número Comprobante"
+        col_razon_arca = "Denominación o Razón Social"
+        col_monto_arca = "Importe Ret./Perc."
+        col_tipo_arca = "Descripción Comprobante"
 
     # Columnas del Mayor según el ERP
     col_asiento_m = config_erp.get("asiento", "ASIENTO")
@@ -176,7 +353,9 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     col_cuit_m = config_erp.get("cuit", "CUIT")
 
     # Calculamos montos numéricos limpios
-    df_mayor["MONTO_CALC"] = df_mayor.apply(lambda r: obtener_monto_mayor(r, config_erp), axis=1)
+    df_mayor["MONTO_CALC"] = df_mayor.apply(
+        lambda r: obtener_monto_mayor(r, config_erp, priorizar_total_mayor), axis=1
+    )
     df_arca["MONTO_CALC"] = df_arca.apply(lambda r: round(safe_float(r.get(col_monto_arca)), 2), axis=1)
 
     # Filtrar únicamente registros no nulos en monto
@@ -214,11 +393,11 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     for idx_a, row_a in df_arca.iterrows():
         monto_a = row_a["MONTO_CALC"]
         cuit_a = row_a["CUIT_CLEAN"]
-        
+
         for idx_m, row_m in df_mayor.iterrows():
             if idx_m in mayor_matched_indices:
                 continue
-            
+
             monto_m = row_m["MONTO_CALC"]
             cuit_m = row_m["CUIT_CLEAN"]
 
@@ -296,7 +475,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
                 "asientos_mayor": asientos_str,
                 "fecha_mayor": fecha_m_str,
                 "monto_mayor": sum_mayor,
-                "obs": f"Conciliación por CUIT por lote ({len(group_arca)} reg. ARCA vs {len(group_mayor)} reg. Mayor)",
+                "obs": f"Conciliación por CUIT por lote ({len(group_arca)} reg. {ORI} vs {len(group_mayor)} reg. Mayor)",
             })
 
     # Prioridad 2 para cruce en lote: Razón social sanitizada para los no matcheados por CUIT
@@ -342,7 +521,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
                 "asientos_mayor": asientos_str,
                 "fecha_mayor": fecha_m_str,
                 "monto_mayor": sum_mayor,
-                "obs": f"Conciliación por Razón Social por lote ({len(group_arca)} reg. ARCA vs {len(group_mayor)} reg. Mayor)",
+                "obs": f"Conciliación por Razón Social por lote ({len(group_arca)} reg. {ORI} vs {len(group_mayor)} reg. Mayor)",
             })
 
     final_unmatched_arca = df_arca[~df_arca.index.isin(arca_matched_indices)]
@@ -374,13 +553,16 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
             "monto_mayor": row_m["MONTO_CALC"],
         })
 
+    sheet_pend_arca = f"Pendientes_{ORI}"
+    sheet_pend_mayor = "Pendientes_MAYOR"
+
     wb = openpyxl.Workbook()
     ws_resumen = wb.active
     ws_resumen.title = "Resumen General"
     ws_1a1 = wb.create_sheet(title="Conciliadas 1a1")
     ws_lote = wb.create_sheet(title="Conciliadas por Lote")
-    ws_arca = wb.create_sheet(title="Pendientes_ARCA")
-    ws_mayor = wb.create_sheet(title="Pendientes_MAYOR")
+    ws_arca = wb.create_sheet(title=sheet_pend_arca)
+    ws_mayor = wb.create_sheet(title=sheet_pend_mayor)
 
     for ws in wb.worksheets:
         ws.views.sheetView[0].showGridLines = True
@@ -408,14 +590,18 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     align_right = Alignment(horizontal="right", vertical="center")
     fmt_currency = '"$ "#,##0.00;("$ "#,##0.00);"-"'
 
-    ws_1a1.cell(row=1, column=1, value=f"PARTIDAS CONCILIADAS EXACTAS 1 A 1 ({erp_seleccionado.upper()})").font = font_title
+    sufijo_titulo = f" - {subtitulo}" if subtitulo else ""
+    lbl_cert = "Certif." if ORI == "ARCA" else "Nro Comp."
+    lbl_cert_largo = "Nro Certificado" if ORI == "ARCA" else "Nro Comprobante"
+
+    ws_1a1.cell(row=1, column=1, value=f"PARTIDAS CONCILIADAS EXACTAS 1 A 1 ({erp_seleccionado.upper()}){sufijo_titulo}").font = font_title
     headers_1a1 = [
-        "Certif. ARCA",
-        "Fecha ARCA",
-        "Comprobante ARCA",
-        "CUIT ARCA",
-        "Razón Social ARCA",
-        "Monto ARCA ($)",
+        f"{lbl_cert} {ORI}",
+        f"Fecha {ORI}",
+        f"Comprobante {ORI}",
+        f"CUIT {ORI}",
+        f"Razón Social {ORI}",
+        f"Monto {ORI} ($)",
         "Asiento Mayor",
         "Fecha Mayor",
         "Detalle / Comp. Mayor",
@@ -435,7 +621,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
         ws_1a1.cell(row=r_idx, column=3, value=item["comp_arca"]).alignment = align_center
         ws_1a1.cell(row=r_idx, column=4, value=item["cuit_arca"]).alignment = align_center
         ws_1a1.cell(row=r_idx, column=5, value=item["razon_arca"]).alignment = align_left
-        
+
         c_m1 = ws_1a1.cell(row=r_idx, column=6, value=item["monto_arca"])
         c_m1.number_format, c_m1.alignment = fmt_currency, align_right
 
@@ -444,7 +630,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
         ws_1a1.cell(row=r_idx, column=9, value=item["comp_mayor"]).alignment = align_left
         ws_1a1.cell(row=r_idx, column=10, value=item["cuit_mayor"]).alignment = align_center
         ws_1a1.cell(row=r_idx, column=11, value=item["razon_mayor"]).alignment = align_left
-        
+
         c_m2 = ws_1a1.cell(row=r_idx, column=12, value=item["monto_mayor"])
         c_m2.number_format, c_m2.alignment = fmt_currency, align_right
 
@@ -472,13 +658,13 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     row_1a1_total = r_idx
     cnt_1a1 = len(conciliadas_1a1)
 
-    ws_lote.cell(row=1, column=1, value=f"PARTIDAS CONCILIADAS POR LOTE / CUIT ({erp_seleccionado.upper()})").font = font_title
+    ws_lote.cell(row=1, column=1, value=f"PARTIDAS CONCILIADAS POR LOTE / CUIT ({erp_seleccionado.upper()}){sufijo_titulo}").font = font_title
     headers_lote = [
         "Razón Social / Empresa",
         "CUIT",
-        "Certificados ARCA Incluidos",
-        "Rango Fecha ARCA",
-        "Monto Total ARCA ($)",
+        f"{'Certificados' if ORI == 'ARCA' else 'Comprobantes'} {ORI} Incluidos",
+        f"Rango Fecha {ORI}",
+        f"Monto Total {ORI} ($)",
         "Asientos Mayor Incluidos",
         "Rango Fecha Mayor",
         "Monto Total Mayor ($)",
@@ -495,7 +681,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
         ws_lote.cell(row=r_lote_idx, column=2, value=item["cuit"]).alignment = align_center
         ws_lote.cell(row=r_lote_idx, column=3, value=item["certs_arca"]).alignment = align_center
         ws_lote.cell(row=r_lote_idx, column=4, value=item["fecha_arca"]).alignment = align_center
-        
+
         c_m1 = ws_lote.cell(row=r_lote_idx, column=5, value=item["monto_arca"])
         c_m1.number_format, c_m1.alignment = fmt_currency, align_right
 
@@ -537,15 +723,15 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     row_lote_total = r_lote_idx
     cnt_lote = len(conciliadas_lote)
 
-    ws_arca.cell(row=1, column=1, value="RETENCIONES PENDIENTES EN ARCA (NO REGISTRADAS EN MAYOR)").font = font_title
+    ws_arca.cell(row=1, column=1, value=f"{concepto} PENDIENTES EN {ORI} (NO REGISTRADAS EN MAYOR){sufijo_titulo}").font = font_title
     headers_arca = [
-        "Nro Certificado",
+        lbl_cert_largo,
         "Fecha Reg.",
         "Tipo Comprobante",
         "Nro Comprobante",
         "CUIT Agente",
         "Razón Social Agente",
-        "Monto Retención ($)",
+        "Monto ($)" if ORI != "ARCA" else "Monto Retención ($)",
     ]
     for col_idx, text in enumerate(headers_arca, 1):
         c = ws_arca.cell(row=3, column=col_idx, value=text)
@@ -559,7 +745,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
         ws_arca.cell(row=r_arca_idx, column=4, value=item["comp_arca"]).alignment = align_center
         ws_arca.cell(row=r_arca_idx, column=5, value=item["cuit_arca"]).alignment = align_center
         ws_arca.cell(row=r_arca_idx, column=6, value=item["razon_arca"]).alignment = align_left
-        
+
         c_m = ws_arca.cell(row=r_arca_idx, column=7, value=item["monto_arca"])
         c_m.number_format, c_m.alignment = fmt_currency, align_right
 
@@ -568,7 +754,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
             ws_arca.cell(row=r_arca_idx, column=c).border = thin_border
         r_arca_idx += 1
 
-    ws_arca.cell(row=r_arca_idx, column=1, value="TOTAL PENDIENTE ARCA").font = font_bold
+    ws_arca.cell(row=r_arca_idx, column=1, value=f"TOTAL PENDIENTE {ORI}").font = font_bold
     c_totarca = ws_arca.cell(row=r_arca_idx, column=7, value=f"=SUM(G4:G{r_arca_idx-1})")
     c_totarca.font, c_totarca.number_format, c_totarca.alignment = font_bold, fmt_currency, align_right
 
@@ -579,7 +765,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     row_arca_total = r_arca_idx
     cnt_arca = len(pendientes_arca)
 
-    ws_mayor.cell(row=1, column=1, value=f"REGISTROS PENDIENTES EN MAYOR ({erp_seleccionado.upper()})").font = font_title
+    ws_mayor.cell(row=1, column=1, value=f"REGISTROS PENDIENTES EN MAYOR ({erp_seleccionado.upper()}){sufijo_titulo}").font = font_title
     headers_mayor = [
         "Nro Asiento",
         "Fecha Contable",
@@ -601,7 +787,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
         ws_mayor.cell(row=r_mayor_idx, column=4, value=item["ref_mayor"]).alignment = align_center
         ws_mayor.cell(row=r_mayor_idx, column=5, value=item["cuit_mayor"]).alignment = align_center
         ws_mayor.cell(row=r_mayor_idx, column=6, value=item["razon_mayor"]).alignment = align_left
-        
+
         c_m = ws_mayor.cell(row=r_mayor_idx, column=7, value=item["monto_mayor"])
         c_m.number_format, c_m.alignment = fmt_currency, align_right
 
@@ -621,11 +807,11 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     row_mayor_total = r_mayor_idx
     cnt_mayor = len(pendientes_mayor)
 
-    ws_resumen.cell(row=1, column=1, value=f"CONCILIACIÓN DE RETENCIONES - MAYOR {erp_seleccionado.upper()} VS ARCA").font = font_title
+    ws_resumen.cell(row=1, column=1, value=f"CONCILIACIÓN DE {concepto} - MAYOR {erp_seleccionado.upper()} VS {ORI}{sufijo_titulo}").font = font_title
     headers_resumen = [
         "Categoría / Pestaña",
         "Cantidad de Reg.",
-        "Total ARCA ($)",
+        f"Total {ORI} ($)",
         "Total Mayor ($)",
         "Diferencia ($)",
     ]
@@ -649,17 +835,17 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
             "=C6-D6",
         ),
         (
-            "3. Pendientes en ARCA (Sin Mayor)",
+            f"3. Pendientes en {ORI} (Sin Mayor)",
             cnt_arca,
-            f"=Pendientes_ARCA!G{row_arca_total}",
+            f"={sheet_pend_arca}!G{row_arca_total}",
             0,
             "=C7-D7",
         ),
         (
-            "4. Pendientes en MAYOR (Sin ARCA)",
+            f"4. Pendientes en MAYOR (Sin {ORI})",
             cnt_mayor,
             0,
-            f"=Pendientes_MAYOR!G{row_mayor_total}",
+            f"={sheet_pend_mayor}!G{row_mayor_total}",
             "=C8-D8",
         ),
     ]
@@ -716,7 +902,7 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
-    
+
     # Retornar tanto el Excel como los resúmenes para mostrar en Streamlit
     stats = {
         "cnt_1a1": cnt_1a1,
@@ -728,52 +914,38 @@ def procesar_archivos(file_m, file_a, erp_seleccionado):
         "pendientes_arca": pendientes_arca,
         "pendientes_mayor": pendientes_mayor,
     }
-    
+
     return output, stats
 
 
 def parse_autodealer_xls(file_bytes):
     """
     Interpreta un archivo .xls (que puede ser un reporte de texto disfrazado de Excel,
-    o un Excel binario real) extrayendo sus datos línea por línea o fila por fila.
+    un HTML disfrazado, o un Excel binario real) extrayendo sus datos línea por línea o fila por fila.
+
+    El tipo de archivo se detecta por su contenido real (firma de bytes), no por la extensión.
     """
     file_bytes.seek(0)
-    is_text = False
+    raw = file_bytes.read()
+    file_bytes.seek(0)
+
+    es_excel_binario = raw[:4] == b"\xd0\xcf\x11\xe0" or raw[:2] == b"PK"   # .xls (OLE2) o .xlsx (zip)
+    inicio = raw[:2048].lower()
+    es_html = (not es_excel_binario) and (b"<table" in inicio or b"<html" in inicio)
+
     lines = []
-    
-    # 1. Intentar leerlo como texto plano (muy común en ERPs viejos que exportan a .xls)
-    try:
-        content = file_bytes.read().decode('utf-8')
-        lines = content.splitlines()
-        if len(lines) > 0 and "" not in lines[0]:
-            is_text = True
-    except UnicodeDecodeError:
-        try:
-            file_bytes.seek(0)
-            content = file_bytes.read().decode('latin-1')
-            lines = content.splitlines()
-            if len(lines) > 0:
-                is_text = True
-        except Exception:
-            pass
-            
-    # 2. Si no es texto, leerlo como Excel real usando Pandas
-    if not is_text or not lines:
-        file_bytes.seek(0)
-        try:
-            # Usa xlrd para leer el formato viejo .xls
-            df_raw = pd.read_excel(file_bytes, header=None, dtype=str, engine="xlrd")
-        except Exception:
-            # Fallback por si acaso es .xlsx u otro formato soportado
-            file_bytes.seek(0)
+
+    if es_excel_binario or es_html:
+        if es_html:
+            df_raw = pd.read_html(io.StringIO(decodificar_texto(raw)))[0]
+        else:
             try:
-                df_raw = pd.read_excel(file_bytes, header=None, dtype=str)
+                # xlrd lee el formato viejo .xls
+                df_raw = pd.read_excel(io.BytesIO(raw), header=None, dtype=str, engine="xlrd")
             except Exception:
-                # Fallback final a HTML disfrazado
-                file_bytes.seek(0)
-                df_raw = pd.read_html(file_bytes)[0]
-        
-        lines = []
+                # Si no era .xls, probamos el motor por defecto (.xlsx)
+                df_raw = pd.read_excel(io.BytesIO(raw), header=None, dtype=str)
+
         # Reconstruimos las filas del dataframe a texto para usar el motor de Regex
         for _, row in df_raw.iterrows():
             row_vals = []
@@ -784,52 +956,55 @@ def parse_autodealer_xls(file_bytes):
                     if re.match(r'^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?$', v_str):
                         try:
                             v_str = pd.to_datetime(v_str).strftime('%d/%m/%Y')
-                        except:
+                        except Exception:
                             pass
                     row_vals.append(v_str)
             if row_vals:
                 lines.append(" ".join(row_vals))
+    else:
+        # Reporte de texto plano (muy común en ERPs viejos que exportan a .xls / .prn)
+        lines = decodificar_texto(raw).splitlines()
 
     data = []
-    
+
     for line in lines:
         line = line.strip()
         # Patrón inicial: Validamos que la línea empiece con un Asiento y una Fecha sí o sí
         if not re.search(r'^\d+\s+\d{2}/\d{2}/\d{4}', line):
             continue
-        
+
         # 1. Extraemos Asiento y Fecha
         asiento = re.search(r'^(\d+)', line).group(1)
         fecha = re.search(r'(\d{2}/\d{2}/\d{4})', line).group(1)
-        
+
         # Cortamos lo que ya extrajimos del texto original
         resto = line.replace(asiento, "", 1).replace(fecha, "", 1).strip()
-        
+
         # 2. Buscamos Referencia (Ej: PV 12132/0, US 12187/1)
         referencia = ""
         m_ref = re.search(r'^[A-Z]{2}\s\d+/\d', resto)
         if m_ref:
             referencia = m_ref.group(0)
             resto = resto.replace(referencia, "", 1).strip()
-            
+
         # 3. Buscamos Detalle / Recibo (Ej: RC-X-0100-00104458)
         detalle = ""
         m_det = re.search(r'^[A-Za-z0-9]+\-[A-Za-z0-9\-]+', resto)
         if m_det:
             detalle = m_det.group(0)
             resto = resto.replace(detalle, "", 1).strip()
-            
+
         # 4. Extraemos todos los montos con decimales desde el texto restante
         # Usamos un patrón flexible para soportar formatos con comas, puntos o reconstruidos por pandas
         amt_pattern = r'\b(?:\d{1,3}(?:[.,]\d{3})+|\d+)[.,]\d{1,2}\b'
         montos = re.findall(amt_pattern, resto)
-        
+
         # Quitamos los montos del texto para aislar la Entidad y el Centro de Costo
         for m in montos:
             resto = resto.replace(m, "", 1)
-            
+
         resto = resto.strip()
-        
+
         # 5. Separamos Centro de Costo (última palabra pegada al final) de la Entidad
         centro_costo = ""
         entidad = resto
@@ -837,13 +1012,13 @@ def parse_autodealer_xls(file_bytes):
         if m_cc:
             centro_costo = m_cc.group(1)
             entidad = resto[:m_cc.start()].strip()
-        
+
         # Limpiamos espacios dobles accidentales en la entidad resultante
         entidad = re.sub(r'\s+', ' ', entidad).strip()
-        
+
         # Formateamos REF corta (quitando lo que está después de la barra)
         ref_corta = referencia.split('/')[0] if referencia else ""
-        
+
         # 6. Acomodamos DEBE, HABER, SALDO según la cantidad de montos extraídos
         debe, haber, saldo = "", "", ""
         if len(montos) >= 3:
@@ -853,7 +1028,7 @@ def parse_autodealer_xls(file_bytes):
             debe, saldo = montos[0], montos[1]
         elif len(montos) == 1:
             saldo = montos[0]
-            
+
         data.append({
             "ASIENTO": asiento,
             "FECHA": fecha,
@@ -866,9 +1041,9 @@ def parse_autodealer_xls(file_bytes):
             "SALDO": saldo,
             "CENTRO DE COSTO": centro_costo
         })
-        
+
     df = pd.DataFrame(data)
-    
+
     # Guardar en memoria como Excel
     output = io.BytesIO()
     df.to_excel(output, index=False, sheet_name="Mayor Formateado")
@@ -876,138 +1051,287 @@ def parse_autodealer_xls(file_bytes):
     return output
 
 
-st.sidebar.title("🛠️ Herramientas")
-modo_app = st.sidebar.radio(
-    "Selecciona un módulo:", 
-    ["🔄 Conciliador de Retenciones", "✨ Formatear Mayor (XLS)"]
-)
-st.sidebar.markdown("---")
-
-if modo_app == "🔄 Conciliador de Retenciones":
-    st.title("📊 Conciliador Contable de Retenciones (ARCA vs ERP)")
-    st.markdown(
-        "Selecciona el **ERP de origen**, carga los reportes de **Mayor** y **Mis Retenciones (ARCA)**, "
-        "y genera el cruce automático con validación por **CUIT y Razón Social**."
+def main():
+    st.sidebar.title("🛠️ Herramientas")
+    modo_app = st.sidebar.radio(
+        "Selecciona un módulo:",
+        ["🔄 Conciliador de Retenciones", "🧾 Conciliador de Percepciones IIBB", "✨ Formatear Mayor (XLS)"]
     )
+    st.sidebar.markdown("---")
 
-    st.warning("⚠️ **ATENCIÓN:** Solo se admiten archivos en formato moderno **.xlsx**. Si tus archivos son `.xls` (muy común en ARCA/AFIP), ábrelos en Excel y guárdalos como `.xlsx` antes de subirlos.", icon="⚠️")
-
-    with st.sidebar:
-        st.header("⚙️ Configuración del Cruce")
-        erp_seleccionado = st.radio(
-            "Selecciona el ERP del Mayor:",
-            options=["AutoDealer", "Bejerman"],
-            help="Adapta dinámicamente las referencias de los encabezados según el sistema contable emisor."
+    if modo_app == "🔄 Conciliador de Retenciones":
+        st.title("📊 Conciliador Contable de Retenciones (ARCA vs ERP)")
+        st.markdown(
+            "Selecciona el **ERP de origen**, carga los reportes de **Mayor** y **Mis Retenciones (ARCA)**, "
+            "y genera el cruce automático con validación por **CUIT y Razón Social**."
         )
-        
-        st.markdown("---")
-        st.markdown("### 📌 Mapeo activo")
-        cfg = ERP_CONFIGS[erp_seleccionado]
-        st.caption(f"**Asiento:** `{cfg.get('asiento')}`")
-        st.caption(f"**Fecha:** `{cfg.get('fecha')}`")
-        st.caption(f"**Detalle / Concepto:** `{cfg.get('detalle')}`")
-        st.caption(f"**Referencia:** `{cfg.get('referencia')}`")
-        if cfg.get("ref_secundaria"):
+
+        st.warning("⚠️ **ATENCIÓN:** Solo se admiten archivos en formato moderno **.xlsx**. Si tus archivos son `.xls` (muy común en ARCA/AFIP), ábrelos en Excel y guárdalos como `.xlsx` antes de subirlos.", icon="⚠️")
+
+        with st.sidebar:
+            st.header("⚙️ Configuración del Cruce")
+            erp_seleccionado = st.radio(
+                "Selecciona el ERP del Mayor:",
+                options=["AutoDealer", "Bejerman"],
+                help="Adapta dinámicamente las referencias de los encabezados según el sistema contable emisor."
+            )
+
+            st.markdown("---")
+            st.markdown("### 📌 Mapeo activo")
+            cfg = ERP_CONFIGS[erp_seleccionado]
+            st.caption(f"**Asiento:** `{cfg.get('asiento')}`")
+            st.caption(f"**Fecha:** `{cfg.get('fecha')}`")
+            st.caption(f"**Detalle / Concepto:** `{cfg.get('detalle')}`")
+            st.caption(f"**Referencia:** `{cfg.get('referencia')}`")
+            if cfg.get("ref_secundaria"):
+                st.caption(f"**Ref Secundario:** `{cfg.get('ref_secundaria')}`")
+            st.caption(f"**Razón Social:** `{cfg.get('entidad')}`")
+            st.caption(f"**CUIT:** `{cfg.get('cuit')}`")
+            st.caption(f"**Debe:** `{cfg.get('debe')}` | **Haber:** `{cfg.get('haber')}`")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            file_mayor = st.file_uploader(
+                f"Subir Mayor (.xlsx) ({erp_seleccionado})", type=["xlsx"], key="mayor"
+            )
+
+        with col2:
+            file_arca = st.file_uploader(
+                "Subir MisRetenciones (.xlsx) (ARCA)", type=["xlsx"], key="arca"
+            )
+
+        if file_mayor and file_arca:
+            st.info(f"💡 Listo para realizar el cruce utilizando la estructura de **{erp_seleccionado}**.")
+
+            if st.button("⚙️ Procesar Conciliación", type="primary", use_container_width=True):
+                with st.spinner("Procesando retenciones y aplicando cruce por CUIT..."):
+                    try:
+                        excel_bytes, stats = procesar_archivos(file_mayor, file_arca, erp_seleccionado)
+
+                        st.success("✅ ¡Conciliación completada con éxito!")
+
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Conciliados 1 a 1", stats["cnt_1a1"])
+                        m2.metric("Conciliados por Lote", stats["cnt_lote"])
+                        m3.metric("Pendientes ARCA", stats["cnt_arca"])
+                        m4.metric("Pendientes Mayor", stats["cnt_mayor"])
+
+                        st.download_button(
+                            label="📥 Descargar Reporte Conciliado en Excel",
+                            data=excel_bytes,
+                            file_name=f"Conciliacion_Retenciones_{erp_seleccionado}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+
+                        st.markdown("### 🔍 Previsualización de Resultados")
+                        tab1, tab2, tab3, tab4 = st.tabs([
+                            "Exactas 1a1", "Por Lote / CUIT", "Pendientes ARCA", "Pendientes Mayor"
+                        ])
+
+                        with tab1:
+                            if stats["conciliadas_1a1"]:
+                                st.dataframe(pd.DataFrame(stats["conciliadas_1a1"]), use_container_width=True)
+                            else:
+                                st.info("No se encontraron registros 1 a 1 exactos.")
+
+                        with tab2:
+                            if stats["conciliadas_lote"]:
+                                st.dataframe(pd.DataFrame(stats["conciliadas_lote"]), use_container_width=True)
+                            else:
+                                st.info("No se encontraron registros acumulados por lote.")
+
+                        with tab3:
+                            if stats["pendientes_arca"]:
+                                st.dataframe(pd.DataFrame(stats["pendientes_arca"]), use_container_width=True)
+                            else:
+                                st.success("🎉 ¡No hay retenciones pendientes en ARCA!")
+
+                        with tab4:
+                            if stats["pendientes_mayor"]:
+                                st.dataframe(pd.DataFrame(stats["pendientes_mayor"]), use_container_width=True)
+                            else:
+                                st.success("🎉 ¡No hay registros pendientes en el Mayor!")
+                    except ValueError as ve:
+                        st.error(f"⚠️ {str(ve)}", icon="🛑")
+                    except Exception as error:
+                        st.error(f"❌ Ocurrió un error inesperado al procesar los archivos: {str(error)}", icon="❌")
+
+    elif modo_app == "🧾 Conciliador de Percepciones IIBB":
+        st.title("🧾 Conciliador de Percepciones IIBB (Listado del sistema vs Mayor Bejerman)")
+        st.markdown(
+            "Carga el **Mayor de Bejerman** (una sola jurisdicción por reporte), el **.txt de percepciones** del mes "
+            "y el **listado de CUIT Proveedores**. Luego elegí la jurisdicción a conciliar."
+        )
+        st.warning("⚠️ El Mayor debe estar en formato **.xlsx**. El cruce usa la columna **ImpTotal_Loc** (las NC van en negativo).", icon="⚠️")
+
+        with st.sidebar:
+            st.header("⚙️ Configuración del Cruce")
+            st.caption("ERP del Mayor: **Bejerman** (fijo en este módulo)")
+            st.markdown("---")
+            st.markdown("### 📌 Mapeo activo")
+            cfg = ERP_CONFIGS["Bejerman"]
+            st.caption(f"**Asiento:** `{cfg.get('asiento')}`")
+            st.caption(f"**Fecha:** `{cfg.get('fecha')}`")
+            st.caption(f"**Detalle / Concepto:** `{cfg.get('detalle')}`")
             st.caption(f"**Ref Secundario:** `{cfg.get('ref_secundaria')}`")
-        st.caption(f"**Razón Social:** `{cfg.get('entidad')}`")
-        st.caption(f"**CUIT:** `{cfg.get('cuit')}`")
-        st.caption(f"**Debe:** `{cfg.get('debe')}` | **Haber:** `{cfg.get('haber')}`")
+            st.caption(f"**Razón Social:** `{cfg.get('entidad')}`")
+            st.caption(f"**CUIT:** `{cfg.get('cuit')}`")
+            st.caption(f"**Monto de cruce:** `{cfg.get('saldo')}`")
 
-    col1, col2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            file_mayor_p = st.file_uploader("Subir Mayor Bejerman (.xlsx)", type=["xlsx"], key="mayor_iibb")
+        with c2:
+            file_txt = st.file_uploader("Subir listado de percepciones (.txt)", type=["txt"], key="txt_iibb")
+        with c3:
+            file_prov = st.file_uploader("Subir CUIT Proveedores (.txt)", type=["txt"], key="prov_iibb")
 
-    with col1:
-        file_mayor = st.file_uploader(
-            f"Subir Mayor (.xlsx) ({erp_seleccionado})", type=["xlsx"], key="mayor"
+        df_txt = None
+        jurisdiccion = None
+
+        if file_txt:
+            try:
+                df_txt = parse_percepciones_txt(file_txt.getvalue())
+            except Exception as e:
+                st.error(f"❌ No se pudo interpretar el .txt de percepciones: {e}")
+
+            if df_txt is not None and df_txt.empty:
+                st.error("❌ No se encontraron líneas con el formato esperado en el .txt de percepciones.")
+                df_txt = None
+
+        if df_txt is not None:
+            resumen_jur = df_txt.groupby("Jurisdicción")["Monto"].agg(["count", "sum"])
+            jurisdicciones = sorted(resumen_jur.index.tolist())
+
+            def _fmt_jur(j):
+                n = int(resumen_jur.loc[j, "count"])
+                total = resumen_jur.loc[j, "sum"]
+                return f"{j}  —  {n} registros  —  $ {total:,.2f}"
+
+            jurisdiccion = st.selectbox(
+                "¿Qué jurisdicción necesitás conciliar?",
+                options=jurisdicciones,
+                format_func=_fmt_jur,
+            )
+
+            with st.expander("👁️ Ver el .txt ya formateado (todas las jurisdicciones)"):
+                st.dataframe(df_txt, use_container_width=True)
+                buf = io.BytesIO()
+                df_txt.to_excel(buf, index=False, sheet_name="Percepciones")
+                buf.seek(0)
+                st.download_button(
+                    "📥 Descargar .txt formateado (.xlsx)",
+                    data=buf,
+                    file_name="Percepciones_Formateadas.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+        if file_mayor_p and df_txt is not None and file_prov and jurisdiccion:
+            st.info(f"💡 Listo para conciliar la jurisdicción **{jurisdiccion}** contra el Mayor de Bejerman.")
+
+            if st.button("⚙️ Procesar Conciliación", type="primary", use_container_width=True):
+                with st.spinner("Procesando percepciones y aplicando cruce..."):
+                    try:
+                        padron = cargar_padron_proveedores(file_prov.getvalue())
+                        df_j = df_txt[df_txt["Jurisdicción"] == jurisdiccion].copy()
+                        df_j = agregar_razon_social(df_j, padron)
+                        df_motor = construir_df_motor(df_j)
+
+                        excel_bytes, stats = procesar_archivos(
+                            file_mayor_p,
+                            None,
+                            "Bejerman",
+                            df_arca_override=df_motor,
+                            origen_label="IIBB",
+                            concepto="PERCEPCIONES IIBB",
+                            subtitulo=f"JURISDICCIÓN {jurisdiccion}",
+                            priorizar_total_mayor=True,
+                        )
+
+                        st.success(f"✅ ¡Conciliación de la jurisdicción {jurisdiccion} completada!")
+
+                        sin_rs = df_j[df_j["Razón Social"] == SIN_RAZON_SOCIAL]["CUIT"].unique().tolist()
+                        if sin_rs:
+                            st.warning(
+                                f"⚠️ {len(sin_rs)} CUIT del .txt no figuran en el listado de proveedores "
+                                f"(se informan como '{SIN_RAZON_SOCIAL}'): " + ", ".join(sin_rs)
+                            )
+
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Conciliados 1 a 1", stats["cnt_1a1"])
+                        m2.metric("Conciliados por Lote", stats["cnt_lote"])
+                        m3.metric("Pendientes IIBB", stats["cnt_arca"])
+                        m4.metric("Pendientes Mayor", stats["cnt_mayor"])
+
+                        st.download_button(
+                            label="📥 Descargar Reporte Conciliado en Excel",
+                            data=excel_bytes,
+                            file_name=f"Conciliacion_Percepciones_IIBB_{jurisdiccion}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+
+                        st.markdown("### 🔍 Previsualización de Resultados")
+                        tab1, tab2, tab3, tab4 = st.tabs([
+                            "Exactas 1a1", "Por Lote / CUIT", "Pendientes IIBB", "Pendientes Mayor"
+                        ])
+                        with tab1:
+                            if stats["conciliadas_1a1"]:
+                                st.dataframe(pd.DataFrame(stats["conciliadas_1a1"]), use_container_width=True)
+                            else:
+                                st.info("No se encontraron registros 1 a 1 exactos.")
+                        with tab2:
+                            if stats["conciliadas_lote"]:
+                                st.dataframe(pd.DataFrame(stats["conciliadas_lote"]), use_container_width=True)
+                            else:
+                                st.info("No se encontraron registros acumulados por lote.")
+                        with tab3:
+                            if stats["pendientes_arca"]:
+                                st.dataframe(pd.DataFrame(stats["pendientes_arca"]), use_container_width=True)
+                            else:
+                                st.success("🎉 ¡No hay percepciones pendientes en el listado!")
+                        with tab4:
+                            if stats["pendientes_mayor"]:
+                                st.dataframe(pd.DataFrame(stats["pendientes_mayor"]), use_container_width=True)
+                            else:
+                                st.success("🎉 ¡No hay registros pendientes en el Mayor!")
+                    except ValueError as ve:
+                        st.error(f"⚠️ {str(ve)}", icon="🛑")
+                    except Exception as error:
+                        st.error(f"❌ Ocurrió un error inesperado al procesar los archivos: {str(error)}", icon="❌")
+
+    elif modo_app == "✨ Formatear Mayor (XLS)":
+        st.title("✨ Formateador Automático de Mayor (AutoDealer)")
+        st.markdown(
+            "Sube tu archivo crudo **.xls** exportado del sistema. "
+            "El motor inteligente extraerá números de comprobante, entidades sociales de longitud variable y montos, "
+            "generando un **Excel tabulado (.xlsx)** listo para el conciliador."
         )
 
-    with col2:
-        file_arca = st.file_uploader(
-            "Subir MisRetenciones (.xlsx) (ARCA)", type=["xlsx"], key="arca"
-        )
+        file_xls = st.file_uploader("📂 Sube el archivo crudo del Mayor", type=["xls", "xlsx", "txt", "prn"])
 
-    if file_mayor and file_arca:
-        st.info(f"💡 Listo para realizar el cruce utilizando la estructura de **{erp_seleccionado}**.")
-        
-        if st.button("⚙️ Procesar Conciliación", type="primary", use_container_width=True):
-            with st.spinner("Procesando retenciones y aplicando cruce por CUIT..."):
-                try:
-                    excel_bytes, stats = procesar_archivos(file_mayor, file_arca, erp_seleccionado)
-                    
-                    st.success("✅ ¡Conciliación completada con éxito!")
-                    
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Conciliados 1 a 1", stats["cnt_1a1"])
-                    m2.metric("Conciliados por Lote", stats["cnt_lote"])
-                    m3.metric("Pendientes ARCA", stats["cnt_arca"])
-                    m4.metric("Pendientes Mayor", stats["cnt_mayor"])
+        if file_xls:
+            st.info("💡 Archivo leído. Listo para ser interpretado y estructurado.")
+            if st.button("🪄 Ejecutar Formateo", type="primary", use_container_width=True):
+                with st.spinner("Desglosando registros del mayor y limpiando columnas..."):
+                    try:
+                        excel_formateado = parse_autodealer_xls(file_xls)
+                        st.success("✅ ¡Archivo procesado y estructurado con éxito!")
 
-                    st.download_button(
-                        label="📥 Descargar Reporte Conciliado en Excel",
-                        data=excel_bytes,
-                        file_name=f"Conciliacion_Retenciones_{erp_seleccionado}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
+                        st.download_button(
+                            label="📥 Descargar Mayor Formateado (.xlsx)",
+                            data=excel_formateado,
+                            file_name="Mayor_AutoDealer_Formateado.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
 
-                    st.markdown("### 🔍 Previsualización de Resultados")
-                    tab1, tab2, tab3, tab4 = st.tabs([
-                        "Exactas 1a1", "Por Lote / CUIT", "Pendientes ARCA", "Pendientes Mayor"
-                    ])
+                        st.markdown("⚠️ *Recomendación: Verifica que el formato descargado sea el esperado (especialmente la separación DEBE/HABER/SALDO) antes de importarlo al conciliador.*")
+                    except Exception as e:
+                        st.error(f"❌ Ocurrió un error al procesar el archivo: {str(e)}")
 
-                    with tab1:
-                        if stats["conciliadas_1a1"]:
-                            st.dataframe(pd.DataFrame(stats["conciliadas_1a1"]), use_container_width=True)
-                        else:
-                            st.info("No se encontraron registros 1 a 1 exactos.")
 
-                    with tab2:
-                        if stats["conciliadas_lote"]:
-                            st.dataframe(pd.DataFrame(stats["conciliadas_lote"]), use_container_width=True)
-                        else:
-                            st.info("No se encontraron registros acumulados por lote.")
-
-                    with tab3:
-                        if stats["pendientes_arca"]:
-                            st.dataframe(pd.DataFrame(stats["pendientes_arca"]), use_container_width=True)
-                        else:
-                            st.success("🎉 ¡No hay retenciones pendientes en ARCA!")
-
-                    with tab4:
-                        if stats["pendientes_mayor"]:
-                            st.dataframe(pd.DataFrame(stats["pendientes_mayor"]), use_container_width=True)
-                        else:
-                            st.success("🎉 ¡No hay registros pendientes en el Mayor!")
-                except ValueError as ve:
-                    st.error(f"⚠️ {str(ve)}", icon="🛑")
-                except Exception as error:
-                    st.error(f"❌ Ocurrió un error inesperado al procesar los archivos: {str(error)}", icon="❌")
-
-elif modo_app == "✨ Formatear Mayor (XLS)":
-    st.title("✨ Formateador Automático de Mayor (AutoDealer)")
-    st.markdown(
-        "Sube tu archivo crudo **.xls** exportado del sistema. "
-        "El motor inteligente extraerá números de comprobante, entidades sociales de longitud variable y montos, "
-        "generando un **Excel tabulado (.xlsx)** listo para el conciliador."
-    )
-    
-    file_xls = st.file_uploader("📂 Sube el archivo crudo del Mayor", type=["xls", "xlsx", "txt", "prn"])
-    
-    if file_xls:
-        st.info("💡 Archivo leído. Listo para ser interpretado y estructurado.")
-        if st.button("🪄 Ejecutar Formateo", type="primary", use_container_width=True):
-            with st.spinner("Desglosando registros del mayor y limpiando columnas..."):
-                try:
-                    excel_formateado = parse_autodealer_xls(file_xls)
-                    st.success("✅ ¡Archivo procesado y estructurado con éxito!")
-                    
-                    st.download_button(
-                        label="📥 Descargar Mayor Formateado (.xlsx)",
-                        data=excel_formateado,
-                        file_name="Mayor_AutoDealer_Formateado.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-                    
-                    st.markdown("⚠️ *Recomendación: Verifica que el formato descargado sea el esperado (especialmente la separación DEBE/HABER/SALDO) antes de importarlo al conciliador.*")
-                except Exception as e:
-                    st.error(f"❌ Ocurrió un error al procesar el archivo: {str(e)}")
+if __name__ == "__main__":
+    main()
