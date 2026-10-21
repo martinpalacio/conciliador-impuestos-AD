@@ -541,7 +541,7 @@ def procesar_archivos(
     for idx_m, row_m in final_unmatched_mayor.iterrows():
         ref_val = str(row_m.get(col_ref_m, ""))
         if col_ref_sec_m and row_m.get(col_ref_sec_m):
-            ref_val += {row_m.get(col_ref_sec_m)}"
+            ref_val += f" / {row_m.get(col_ref_sec_m)}"
 
         pendientes_mayor.append({
             "asiento_mayor": row_m["ASIENTO_STR"],
