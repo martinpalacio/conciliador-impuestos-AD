@@ -1,4 +1,8 @@
 streamlit
 pandas
 openpyxl
-xlrd>=2.0.1
+lxml
+html5lib
+xlrd
+# solo para tests:
+pytest
