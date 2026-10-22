@@ -18,7 +18,7 @@
       percepciones.py         txt IIBB, padrón de proveedores
       autodealer.py           Mayor crudo AutoDealer → xlsx
     reports/                Salida Excel
-      styles.py / excel_helpers.py / excel_report.py
+      styles.py / excel_helpers.py / excel_report.py / mayor_excel.py
     ui/                     Streamlit (una página por módulo)
       components.py, retenciones_page.py, percepciones_page.py, formatear_page.py
 

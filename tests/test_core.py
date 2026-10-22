@@ -53,3 +53,17 @@ def test_match_por_lote_cuit_suma_grupo():
 def test_formula_suma_vacia_no_es_circular():
     assert formula_suma("G", 4, 4) == 0          # sin filas: evita =SUM(G4:G3)
     assert formula_suma("G", 4, 7) == "=SUM(G4:G6)"
+
+
+def test_match_1a1_toma_la_primera_fila_libre_del_mayor():
+    # Dos filas del Mayor con el mismo importe: cada fila externa se queda con la primera libre, en orden
+    ext = _df([[100.0, "", "A", "c1", "", "2025-01-01", ""], [100.0, "", "A", "c2", "", "2025-01-02", ""]])
+    may = _df([[100.0, "", "A", "", "7", "", "2025-01-03"], [100.0, "", "A", "", "8", "", "2025-01-04"]])
+    res = match_1a1(ext, may, COLS_E, COLS_M, set(), set())
+    assert [r["asiento_mayor"] for r in res] == ["7", "8"]
+
+
+def test_match_1a1_no_cruza_cuits_distintos_y_respeta_tolerancia():
+    ext = _df([[100.0, "111", "A", "c1", "", "2025-01-01", ""], [200.0, "", "A", "c2", "", "2025-01-01", ""]])
+    may = _df([[100.0, "222", "A", "", "1", "", "2025-01-03"], [200.02, "", "A", "", "2", "", "2025-01-03"]])
+    assert match_1a1(ext, may, COLS_E, COLS_M, set(), set()) == []   # CUIT distinto / diferencia de 2 centavos

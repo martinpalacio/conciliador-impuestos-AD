@@ -5,6 +5,8 @@ simples, para poder testearlas por separado o agregar nuevas (p. ej. cruce por f
 Contrato común: reciben los DataFrames ya preparados y los conjuntos de índices ya
 conciliados, los actualizan in-place y devuelven la lista de conciliaciones nuevas.
 """
+from collections import defaultdict
+
 from config import TOLERANCIA_1A1, TOLERANCIA_LOTE
 
 
@@ -22,27 +24,54 @@ def _detalle_comprobante_mayor(row_m, cols_m):
     return detalle
 
 
+def _centavos(monto):
+    return int(round(monto * 100))
+
+
+def _indexar_por_centavos(montos):
+    """{centavos: [posiciones en orden]} → permite buscar candidatos por importe sin recorrer todo el Mayor."""
+    indice = defaultdict(list)
+    for pos, monto in enumerate(montos):
+        indice[_centavos(monto)].append(pos)
+    return indice
+
+
 def match_1a1(df_ext, df_mayor, cols_e, cols_m, idx_ext_ok, idx_mayor_ok):
-    """Cruce exacto: mismo monto (±tolerancia) y mismo CUIT cuando ambos lo tienen."""
+    """
+    Cruce exacto: mismo monto (±tolerancia) y mismo CUIT cuando ambos lo tienen.
+
+    Para cada fila externa toma la PRIMERA fila libre del Mayor (en su orden original) que cumple la
+    condición. Los candidatos se buscan por importe en un índice (±1 centavo), por lo que el costo
+    crece de forma lineal y no cuadrática con la cantidad de filas.
+    """
     conciliadas = []
+
+    idx_m = df_mayor.index.tolist()
+    montos_m = df_mayor["MONTO_CALC"].tolist()
+    cuits_m = df_mayor["CUIT_CLEAN"].tolist()
+    indice = _indexar_por_centavos(montos_m)
 
     for idx_e, row_e in df_ext.iterrows():
         monto_e = row_e["MONTO_CALC"]
         cuit_e = row_e["CUIT_CLEAN"]
 
-        for idx_m, row_m in df_mayor.iterrows():
-            if idx_m in idx_mayor_ok:
+        c = _centavos(monto_e)
+        candidatos = sorted(pos for k in (c - 1, c, c + 1) for pos in indice.get(k, ()))
+
+        for pos in candidatos:
+            if idx_m[pos] in idx_mayor_ok:
                 continue
 
-            monto_m = row_m["MONTO_CALC"]
-            cuit_m = row_m["CUIT_CLEAN"]
+            monto_m = montos_m[pos]
+            cuit_m = cuits_m[pos]
 
             monto_coincide = abs(monto_e - monto_m) < TOLERANCIA_1A1
             cuit_coincide = (cuit_e == cuit_m) if (cuit_e and cuit_m) else True
 
             if monto_coincide and cuit_coincide:
+                row_m = df_mayor.iloc[pos]
                 idx_ext_ok.add(idx_e)
-                idx_mayor_ok.add(idx_m)
+                idx_mayor_ok.add(idx_m[pos])
 
                 conciliadas.append({
                     "cert_arca": row_e["CERT_STR"],

@@ -1,6 +1,14 @@
-"""Parser del Mayor crudo de AutoDealer (.xls / HTML / texto plano) → Excel tabulado."""
+"""
+Parser del Mayor crudo de AutoDealer → DataFrame tabulado + controles contables.
+
+Dos caminos, elegidos por el CONTENIDO del archivo (no por la extensión):
+  1) Por columnas (preferido): el export nativo (.xls binario / HTML) ya trae una columna por dato.
+     Se leen directamente, sin aplanar a texto: es exacto y permite validar contra el saldo final.
+  2) Por texto (fallback): reportes de texto plano (.prn / .txt) o layouts desconocidos, con regex.
+"""
 import io
 import re
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -58,13 +66,22 @@ def _dataframe_a_lineas(df_raw):
     return lines
 
 
-def leer_lineas(raw):
+def leer_lineas(raw, df_raw=None):
     """Convierte el contenido crudo (Excel, HTML o texto plano) en una lista de líneas."""
-    es_excel_binario, es_html = _detectar_tipo(raw)
-    if es_excel_binario or es_html:
-        return _dataframe_a_lineas(_leer_dataframe_crudo(raw, es_html))
+    if df_raw is None:
+        df_raw = _cargar_dataframe(raw)
+    if df_raw is not None:
+        return _dataframe_a_lineas(df_raw)
     # Reporte de texto plano (muy común en ERPs viejos que exportan a .xls / .prn)
     return decodificar_texto(raw).splitlines()
+
+
+def _cargar_dataframe(raw):
+    """DataFrame crudo (sin encabezados, todo texto) si el archivo es Excel/HTML; None si es texto plano."""
+    es_excel_binario, es_html = _detectar_tipo(raw)
+    if es_excel_binario or es_html:
+        return _leer_dataframe_crudo(raw, es_html)
+    return None
 
 
 # --- 2. Parseo: una línea de texto → un registro --------------------------------------
@@ -137,21 +154,155 @@ def parsear_linea(line):
     }
 
 
-# --- 3. Salida --------------------------------------------------------------------------
+# --- 3. Camino por columnas (export nativo del ERP) ----------------------------------
 
-def parse_autodealer_xls(file_bytes):
+COLUMNAS_SALIDA = [
+    "ASIENTO", "FECHA", "Referencia", "DETALLE", "REF", "ENTIDAD",
+    "DEBE", "HABER", "SALDO", "CENTRO DE COSTO",
+]
+_SEPARADOR_CONCEPTO = " / "          # con espacios: no rompe textos como "DJ IVA 02/2026"
+_RE_ASIENTO = r"\d+(\.0+)?"
+_RE_FECHA = r"(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2}.*)"
+
+# Posiciones del export nativo (no trae encabezados)
+_C_ASIENTO, _C_FECHA, _C_REFERENCIA, _C_CONCEPTO, _C_DEBE, _C_HABER, _C_SALDO_ERP, _C_CC = range(8)
+
+
+def _filas_movimiento(df_raw):
+    """Filas que son movimientos: asiento numérico en la col. 0 y fecha en la col. 1."""
+    if df_raw.shape[1] < 8:
+        return df_raw.iloc[0:0]
+    c0 = df_raw[_C_ASIENTO].astype(str).str.strip()
+    c1 = df_raw[_C_FECHA].astype(str).str.strip()
+    return df_raw[c0.str.fullmatch(_RE_ASIENTO) & c1.str.fullmatch(_RE_FECHA)]
+
+
+def _es_export_nativo(movs, umbral=0.9):
     """
-    Interpreta un archivo .xls (reporte de texto disfrazado de Excel, HTML disfrazado
-    o Excel binario real) y devuelve un BytesIO con el Mayor tabulado en .xlsx.
+    Confirma que el layout por posición es el esperado: en (casi) todos los movimientos el saldo del ERP
+    es numérico y hay un importe en Debe o Haber. Evita aplicar el mapeo por columnas a tablas con otro diseño.
     """
+    if len(movs) == 0:
+        return False
+    saldo_ok = movs[_C_SALDO_ERP].map(lambda v: _a_numero(v) is not None)
+    importe_ok = movs[_C_DEBE].map(lambda v: _a_numero(v) is not None) | movs[_C_HABER].map(
+        lambda v: _a_numero(v) is not None)
+    return bool((saldo_ok & importe_ok).mean() >= umbral)
+
+
+def _a_numero(val):
+    """float redondeado a 2 decimales, o None si está vacío. (No usa safe_float: aquí el punto es decimal.)"""
+    if val is None or pd.isna(val) or not str(val).strip():
+        return None
+    try:
+        return round(float(str(val).strip()), 2)
+    except ValueError:
+        return None
+
+
+def _a_texto(val):
+    if val is None or pd.isna(val) or not str(val).strip() or str(val).lower() == "nan":
+        return None
+    return str(val).strip()
+
+
+def dividir_concepto(concepto):
+    """
+    "RC-X-0100-00104458 / PV 12132/0 / SAN CRISTOBAL, Soc. Mutual"  →  (DETALLE, REF, ENTIDAD)
+      DETALLE = comprobante, REF = referencia sin el sufijo "/n", ENTIDAD = resto.
+    Si el concepto no tiene 3 partes (apertura, DDJJ IVA, etc.), DETALLE y ENTIDAD llevan el texto completo.
+    """
+    texto = (concepto or "").strip()
+    partes = [p.strip() for p in texto.split(_SEPARADOR_CONCEPTO)]
+    if len(partes) >= 3:
+        detalle, ref, entidad = partes[0], partes[1], _SEPARADOR_CONCEPTO.join(partes[2:])
+        return detalle, ref.split("/")[0].strip(), entidad, True
+    return texto, "", texto, False
+
+
+def _saldo_de(df_raw, etiqueta):
+    """Valor de la fila 'SALDO INICIAL' / 'SALDO FINAL' del reporte (col. concepto → col. saldo)."""
+    marca = df_raw[_C_CONCEPTO].astype(str).str.strip().str.upper().str.startswith(etiqueta)
+    for val in df_raw.loc[marca, _C_SALDO_ERP]:
+        n = _a_numero(val)
+        if n is not None:
+            return n
+    return None
+
+
+def parsear_columnas(df_raw):
+    """Export nativo → (DataFrame de salida, saldo inicial del ERP, saldo final del ERP, filas sin 3 partes)."""
+    movs = _filas_movimiento(df_raw)
+    registros, sin_tres_partes = [], 0
+
+    for _, r in movs.iterrows():
+        detalle, ref, entidad, tiene_3 = dividir_concepto(_a_texto(r[_C_CONCEPTO]))
+        sin_tres_partes += 0 if tiene_3 else 1
+        debe, haber = _a_numero(r[_C_DEBE]), _a_numero(r[_C_HABER])
+        registros.append({
+            "ASIENTO": int(float(str(r[_C_ASIENTO]).strip())),
+            "FECHA": _normalizar_valor(r[_C_FECHA]),
+            "Referencia": _a_texto(r[_C_REFERENCIA]),
+            "DETALLE": detalle or None,
+            "REF": ref or None,
+            "ENTIDAD": entidad or None,
+            "DEBE": debe,
+            "HABER": haber,
+            "SALDO": round((debe or 0) - (haber or 0), 2),   # por movimiento, no el acumulado del ERP
+            "CENTRO DE COSTO": _a_texto(r[_C_CC]),
+        })
+
+    df = pd.DataFrame(registros, columns=COLUMNAS_SALIDA)
+    return df, _saldo_de(df_raw, "SALDO INICIAL"), _saldo_de(df_raw, "SALDO FINAL"), sin_tres_partes
+
+
+def calcular_control(df, saldo_inicial, saldo_final, sin_tres_partes=0):
+    """
+    Control contable: saldo inicial + Σ Debe − Σ Haber debe igualar el saldo final del ERP.
+    `ok` es None si el reporte no trae saldo final para comparar.
+    """
+    total_debe = round(float(df["DEBE"].fillna(0).sum()), 2)
+    total_haber = round(float(df["HABER"].fillna(0).sum()), 2)
+    calculado = round((saldo_inicial or 0) + total_debe - total_haber, 2)
+    diferencia = None if saldo_final is None else round(calculado - saldo_final, 2)
+    return {
+        "movimientos": len(df),
+        "total_debe": total_debe,
+        "total_haber": total_haber,
+        "saldo_inicial": saldo_inicial,
+        "saldo_final": saldo_final,
+        "saldo_calculado": calculado,
+        "diferencia": diferencia,
+        "ok": None if diferencia is None else abs(diferencia) < 0.01,
+        "sin_tres_partes": sin_tres_partes,
+    }
+
+
+# --- 4. API pública ---------------------------------------------------------------------
+
+@dataclass
+class ResultadoMayor:
+    df: pd.DataFrame
+    metodo: str                      # "columnas" (exacto, con control) | "texto" (regex, sin control)
+    control: dict = field(default_factory=dict)
+
+
+def formatear_mayor(file_bytes):
+    """Lee el Mayor crudo y devuelve un ResultadoMayor (DataFrame + método usado + control contable)."""
     file_bytes.seek(0)
     raw = file_bytes.read()
     file_bytes.seek(0)
 
-    registros = [r for r in (parsear_linea(l) for l in leer_lineas(raw)) if r is not None]
-    df = pd.DataFrame(registros)
+    df_raw = _cargar_dataframe(raw)
+    if df_raw is not None and _es_export_nativo(_filas_movimiento(df_raw)):
+        df, ini, fin, sin_3 = parsear_columnas(df_raw)
+        return ResultadoMayor(df, "columnas", calcular_control(df, ini, fin, sin_3))
 
-    output = io.BytesIO()
-    df.to_excel(output, index=False, sheet_name="Mayor Formateado")
-    output.seek(0)
-    return output
+    registros = [r for r in (parsear_linea(l) for l in leer_lineas(raw, df_raw)) if r is not None]
+    return ResultadoMayor(pd.DataFrame(registros), "texto")
+
+
+def parse_autodealer_xls(file_bytes):
+    """Compatibilidad: devuelve directamente el BytesIO con el .xlsx formateado."""
+    from reports.mayor_excel import generar_excel_mayor
+    return generar_excel_mayor(formatear_mayor(file_bytes).df)
